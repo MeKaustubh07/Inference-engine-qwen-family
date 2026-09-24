@@ -6,7 +6,7 @@ import time
 
 import torch
 
-from safetensors import SafetensorsFile
+from weight_loader import SafetensorsFile
 
 MODEL_DIR = "models/qwen2.5-0.5b"
 config = json.load(open(f"{MODEL_DIR}/config.json"))

@@ -6,7 +6,7 @@ sys.path.insert(0, "src")
 from config import ModelConfig
 from models.qwen2 import Qwen2Model
 from ops import rms_norm
-from safetensors import SafetensorsFile
+from weight_loader import SafetensorsFile
 from tokenizer import Tokenizer
 
 MODEL_DIR = "models/qwen2.5-0.5b"

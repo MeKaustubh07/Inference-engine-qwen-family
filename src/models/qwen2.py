@@ -2,7 +2,7 @@
 import torch
 
 from config import ModelConfig
-from safetensors import SafetensorsFile
+from weight_loader import SafetensorsFile
 
 
 class Qwen2Model:
