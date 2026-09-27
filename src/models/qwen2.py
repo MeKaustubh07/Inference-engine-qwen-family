@@ -111,6 +111,8 @@ class Qwen2Model:
         With a state, the tokens continue from state.length and their keys/values are cached.
         """
         start = state.length if state is not None else 0
+        if state is not None:
+            state.reserve(start + len(ids))          # fail before any layer mutates state (atomic forward)
         positions = torch.arange(start, start + len(ids), device=self.b.device, dtype=torch.int32)
         h = self.embed(ids)
         for layer in range(self.config.num_hidden_layers):

@@ -169,6 +169,8 @@ class Qwen35Model:
                 capture: dict | None = None) -> torch.Tensor:
         """Token ids [T] -> logits [T, vocab]. With a state, continues from state.length and updates it."""
         start = state.length if state is not None else 0
+        if state is not None:
+            state.reserve(start + len(ids))          # fail before any layer mutates state (atomic forward)
         positions = torch.arange(start, start + len(ids), device=self.b.device, dtype=torch.int32)
         h = self.embed(ids)
         if capture is not None:

@@ -31,6 +31,11 @@ class ContiguousKVCache:
     def advance(self, n: int) -> None:
         self.length += n
 
+    def reserve(self, end: int) -> None:
+        """Fail BEFORE any layer runs if positions up to `end` don't fit."""
+        if end > self.max_len:
+            raise ValueError(f"KV cache full: need {end} positions, capacity {self.max_len}")
+
     def bytes_used(self) -> int:
         return 2 * self.k[:, : self.length].numel() * self.k.element_size()
 
@@ -95,6 +100,10 @@ class PagedSequence:
             raise OutOfBlocks(f"need {need} more KV blocks, only {self.pool.allocator.num_free} free")
         self.block_table.extend(self.pool.allocator.allocate() for _ in range(need))
 
+    def reserve(self, end: int) -> None:
+        """Allocate every block needed for positions up to `end` before any layer runs (all-or-nothing)."""
+        self._ensure(end)
+
     def write(self, layer: int, start: int, k: torch.Tensor, v: torch.Tensor) -> None:
         end = start + k.shape[0]
         self._ensure(end)
@@ -147,9 +156,15 @@ class HybridState:
     def advance(self, n: int) -> None:
         self.kv.advance(n)
 
+    def reserve(self, end: int) -> None:
+        self.kv.reserve(end)
+
     def free(self) -> None:
+        """Release KV blocks and reset the recurrent/conv state so the object can't leak history into a reuse."""
         if hasattr(self.kv, "free"):
             self.kv.free()
+        self.S.zero_()
+        self.conv_tail.zero_()
 
     def bytes_used(self) -> int:
         fixed = (self.S.numel() + self.conv_tail.numel()) * 4

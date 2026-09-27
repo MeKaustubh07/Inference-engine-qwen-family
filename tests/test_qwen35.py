@@ -1,4 +1,5 @@
 """Week 13: the Qwen3.5-0.8B port vs the HF fp32 answer key: every layer, logits, greedy decode, cached decode."""
+import glob
 import sys
 import time
 import torch
@@ -22,7 +23,8 @@ def check(name, ok):
     results.append(bool(ok)); print(f"{'PASS' if ok else 'FAIL'}  {name}")
 
 print(f"layer types: {''.join('A' if t == 'full_attention' else 'L' for t in cfg.layer_types)}  (A = gated attention, L = Gated DeltaNet)")
-for n in range(5):
+N_GOLD = len(glob.glob("tests/golden_qwen35/*.pt"))              # 7: includes prompts longer than a 64-token chunk
+for n in range(N_GOLD):
     g = torch.load(f"tests/golden_qwen35/{n}.pt")
     ids = torch.tensor(tok.encode(g["text"]))
     check(f"prompt {n}: tokenizer ids == HF ids ({len(ids)} tokens)", torch.equal(ids, g["ids"]))
@@ -31,27 +33,48 @@ for n in range(5):
     rel = [((cap[f"l{i}_out"] - g[f"l{i}_out"]).abs().max() / g[f"l{i}_out"].abs().max()).item() for i in range(24)]
     worst = max(range(24), key=lambda i: rel[i])
     d_logits = (logits - g["logits"]).abs().max().item()
+    d_norm = ((cap["final_norm"] - g["final_norm"]).abs().max() / g["final_norm"].abs().max()).item()
     agree = (logits.argmax(-1) == g["logits"].argmax(-1)).float().mean().item()
-    check(f"prompt {n}: embed exact, worst layer rel diff {rel[worst]:.1e} (layer {worst}, {cfg.layer_types[worst]}), "
-          f"logits max|diff| {d_logits:.1e}, top-1 agreement {agree:.0%}",
-          torch.equal(cap["embed"], g["embed"]) and max(rel) < 1e-4 and agree == 1.0)
+    check(f"prompt {n} ({len(ids)} tokens): embed exact, worst layer rel diff {rel[worst]:.1e} (layer {worst}, {cfg.layer_types[worst]}), "
+          f"final norm rel {d_norm:.1e}, logits max|diff| {d_logits:.1e}, top-1 {agree:.0%}",
+          torch.equal(cap["embed"], g["embed"]) and max(rel) < 1e-4 and d_norm < 1e-4 and d_logits < 1e-3 and agree == 1.0)
 
 # greedy decoding with the hybrid cache vs HF generate()
 t0 = time.perf_counter()
-for n in range(5):
+for n in range(N_GOLD):
     g = torch.load(f"tests/golden_qwen35/{n}.pt")
     ours = generate_greedy(model, tok, g["text"], 10, EOS)
     hf = g["greedy"].tolist()
     check(f"prompt {n}: cached greedy == HF: {tok.decode(ours)!r}", ours == hf)
-print(f"      greedy decoding, 5 prompts x 10 tokens: {time.perf_counter() - t0:.1f}s")
+print(f"      greedy decoding, {N_GOLD} prompts x 10 tokens: {time.perf_counter() - t0:.1f}s")
 
 # cached decode == uncached, with contiguous and paged attention caches (and the recurrent state carried)
-g = torch.load("tests/golden_qwen35/4.pt"); ids = g["ids"]
+g = torch.load(f"tests/golden_qwen35/{N_GOLD - 1}.pt"); ids = g["ids"]                     # the multi-chunk prompt
 full = model.forward(ids)
-for kind, st in (("contiguous", model.new_state(len(ids))), ("paged", model.new_paged_state(model.new_paged_pool(16, 4)))):
-    parts = [model.forward(ids[:3], state=st), model.forward(ids[3:8], state=st)] + [model.forward(ids[t:t + 1], state=st) for t in range(8, len(ids))]
+T = len(ids)
+for kind, st in (("contiguous", model.new_state(T)), ("paged", model.new_paged_state(model.new_paged_pool(64, 4)))):
+    # prefill 70 (crosses a chunk boundary), continue with a 65-token chunk from the carried state, then single tokens
+    parts = [model.forward(ids[:70], state=st), model.forward(ids[70:135], state=st)] + [model.forward(ids[t:t + 1], state=st) for t in range(135, T)]
     d = (torch.cat(parts) - full).abs().max().item()
-    check(f"hybrid state ({kind} KV + recurrent/conv state): prefill 3 + chunk 5 + single tokens == uncached, max|diff| {d:.1e}", d < 1e-3)
+    check(f"hybrid state ({kind} KV + recurrent/conv): {T} tokens as 70 + 65 + singles == uncached, max|diff| {d:.1e}", d < 1e-3)
+
+# atomic forward: running out of KV blocks fails before ANY layer mutates the recurrent state; free() clears it
+from state import OutOfBlocks
+st = model.new_paged_state(model.new_paged_pool(2, 4))                  # room for 8 tokens only
+model.forward(ids[:6], state=st)
+S_before, tail_before = st.S.clone(), st.conv_tail.clone()
+try:
+    model.forward(ids[6:12], state=st); raised = False
+except OutOfBlocks:
+    raised = True
+check("KV exhaustion raises before any layer runs: recurrent and conv state unchanged, length unchanged",
+      raised and torch.equal(st.S, S_before) and torch.equal(st.conv_tail, tail_before) and st.length == 6)
+st.free()
+check("free() returns blocks and zeroes the recurrent/conv state", st.S.abs().sum() == 0 and st.conv_tail.abs().sum() == 0)
+
+# special tokens declared only in tokenizer_config.json (audio/TTS markers) are single ids, as in HF
+check("tokenizer: '<|audio_start|>' -> [248070], '<tts_pad>' -> [248072], decode round-trips",
+      tok.encode("<|audio_start|>") == [248070] and tok.encode("<tts_pad>") == [248072] and tok.decode([248070]) == "<|audio_start|>")
 
 # Qwen3.5 chat template matches HF's renderer (no default system; empty think block when thinking is off)
 from chat import format_chat
@@ -60,7 +83,11 @@ hf_tok = AutoTokenizer.from_pretrained(D)
 convs = [[{"role": "user", "content": "What is the capital of France?"}],
          [{"role": "system", "content": "You are terse."}, {"role": "user", "content": "Hi"}],
          [{"role": "user", "content": "2+2?"}, {"role": "assistant", "content": "4"}, {"role": "user", "content": "and 3+3?"}],
-         [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "<think>\nreasoning\n</think>\n\nhello"}, {"role": "user", "content": "bye"}]]
+         [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "<think>\nreasoning\n</think>\n\nhello"}, {"role": "user", "content": "bye"}],
+         # what the model really produces in thinking mode: no opening tag (the prompt opened it), trailing newline
+         [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "The user greets me.\n</think>\n\nHello! How can I help?\n"}, {"role": "user", "content": "bye"}],
+         # surrounding whitespace is trimmed; an assistant turn AFTER the last user query keeps its reasoning
+         [{"role": "system", "content": "  Be brief. \n"}, {"role": "user", "content": "  hi \n"}, {"role": "assistant", "content": "thinking\n</think>\n\nhello"}]]
 for c in convs:
     for think in (False, True):
         ok = format_chat(c, style="qwen3.5", enable_thinking=think) == hf_tok.apply_chat_template(c, tokenize=False, add_generation_prompt=True, enable_thinking=think)
@@ -91,10 +118,10 @@ if torch.backends.mps.is_available():
 
     gm = Qwen35Model(cfg, weights, MetalBackend())
     match = 0
-    for n in range(5):
+    for n in range(N_GOLD):
         g = torch.load(f"tests/golden_qwen35/{n}.pt"); out = generate_greedy(gm, tok, g["text"], 10, EOS)
         match += next((j for j, (x_, y_) in enumerate(zip(out, g["greedy"].tolist())) if x_ != y_), min(len(out), len(g["greedy"])))
-    check(f"Metal backend (bf16 weights): greedy matches HF fp32 for {match}/50 tokens", match >= 45)
+    check(f"Metal backend (bf16 weights): greedy matches HF fp32 for {match}/{10 * N_GOLD} tokens", match >= 9 * N_GOLD)
     del gm
 
 print(f"\n{sum(results)}/{len(results)} checks passed")

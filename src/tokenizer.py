@@ -5,6 +5,7 @@ Pipeline (encode):  special-token split -> NFC normalize -> regex pre-split -> b
 """
 import json
 import unicodedata
+from pathlib import Path
 
 import regex  # third-party engine: needed for \p{L} / \p{N} classes that the stdlib `re` lacks
 
@@ -41,6 +42,11 @@ class Tokenizer:
             self.merge_rank[(a, b)] = rank
 
         self.special: dict[str, int] = {t["content"]: t["id"] for t in spec["added_tokens"]}
+        # Some checkpoints declare extra added tokens only in tokenizer_config.json (Qwen3.5: 248070..248076)
+        cfg_path = Path(path).with_name("tokenizer_config.json")
+        if cfg_path.exists():
+            for tid, t in json.load(open(cfg_path, encoding="utf-8")).get("added_tokens_decoder", {}).items():
+                self.special.setdefault(t["content"], int(tid))
         self.id_to_token.update({i: t for t, i in self.special.items()})
         self.special_re = regex.compile("(" + "|".join(regex.escape(s) for s in self.special) + ")")
 
