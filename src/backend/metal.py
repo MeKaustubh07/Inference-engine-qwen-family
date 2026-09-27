@@ -37,6 +37,16 @@ class MetalBackend(TorchBackend):
                              K, N, int(b is not None), int(residual is not None), threads=N * 32, group_size=TG)
         return y
 
+    def gemm(self, x, w):
+        """Tiled-GEMM kernel for prefill (kept for study/benchmarks; linear() uses PyTorch's tuned GEMM)."""
+        x = x.float().contiguous()
+        T, K = x.shape
+        N = w.shape[0]
+        y = torch.empty(T, N, device=self.device)
+        gx, gy = -(-N // 16), -(-T // 16)
+        self.lib.gemm_bf16(y, x, w, T, N, K, threads=(gx * 16, gy * 16), group_size=(16, 16))
+        return y
+
     def swiglu(self, x, w_gate_up):
         if x.shape[0] != 1 or w_gate_up.dtype != torch.bfloat16:
             return super().swiglu(x, w_gate_up)

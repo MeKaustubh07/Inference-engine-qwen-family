@@ -53,6 +53,15 @@ for N, K, bias in ((896, 896, True), (128, 896, True), (4864, 896, False), (896,
     gbps = N * K * 2 / (t_ours * 1e-6) / 1e9
     check(f"matvec {N}x{K}{' +bias' if bias else ''}: rel diff {rel:.1e} | ours {t_ours:.0f} us ({gbps:.0f} GB/s) vs torch {t_torch:.0f} us", rel < 1e-3)
 
+# tiled GEMM (prefill) vs PyTorch's tuned GEMM, including ragged sizes not divisible by the tile
+for T, N, K in ((7, 896, 896), (64, 4864, 896), (256, 896, 4864), (1024, 1152, 896)):
+    W = (torch.randn(N, K) * 0.05).to(torch.bfloat16).to(dev); x = torch.randn(T, K, device=dev)
+    ref = x @ W.float().T
+    rel = maxdiff(mb.gemm(x, W), ref) / ref.abs().max().item()
+    t_ours = bench(lambda: mb.gemm(x, W), 50); t_torch = bench(lambda: (x.to(torch.bfloat16) @ W.T).float(), 50)
+    tflops = 2 * T * N * K / (t_ours * 1e-6) / 1e12
+    check(f"gemm T={T} {N}x{K}: rel diff {rel:.1e} | tiled {t_ours:.0f} us ({tflops:.2f} TFLOP/s) vs torch {t_torch:.0f} us", rel < 1e-3)
+
 # fused kernels: matvec + residual, and SwiGLU (gate and up rows read in one pass)
 W = (torch.randn(896, 4864) * 0.05).to(torch.bfloat16).to(dev); x = torch.randn(1, 4864, device=dev); r = torch.randn(1, 896, device=dev)
 ref = x @ W.float().T + r
