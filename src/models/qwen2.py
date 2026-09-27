@@ -11,10 +11,13 @@ class Qwen2Model:
         self.config = config
         self.weights = weights
         self.embed_table = weights.get("model.embed_tokens.weight")   # [vocab, hidden], bf16 view
+        self._cache: dict[str, torch.Tensor] = {}
 
     def _w(self, name: str) -> torch.Tensor:
-        """Fetch a weight by name and upcast it for the fp32 reference path."""
-        return self.weights.get(name).float()
+        """Fetch a weight by name, upcast once to fp32 for the reference path, and keep it."""
+        if name not in self._cache:
+            self._cache[name] = self.weights.get(name).float()
+        return self._cache[name]
 
     def embed(self, ids: torch.Tensor) -> torch.Tensor:
         """Token ids [T] -> vectors [T, hidden]: row lookup in the embedding table."""
@@ -61,3 +64,12 @@ class Qwen2Model:
         h = h + self.self_attn(layer, rms_norm(h, self._w(p + "input_layernorm.weight"), eps))
         h = h + self.mlp(layer, rms_norm(h, self._w(p + "post_attention_layernorm.weight"), eps))
         return h
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        """Token ids [T] -> logits [T, vocab]: embed, 24 stations, final norm, tied output head."""
+        h = self.embed(ids)
+        for layer in range(self.config.num_hidden_layers):
+            h = self.block(layer, h)
+        h = rms_norm(h, self._w("model.norm.weight"), self.config.rms_norm_eps)
+        # Tied embeddings: the same table that turned ids into vectors now scores vectors against every token.
+        return h @ self._w("model.embed_tokens.weight").T
