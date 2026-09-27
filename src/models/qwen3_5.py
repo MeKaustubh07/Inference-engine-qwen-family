@@ -81,19 +81,24 @@ class Qwen35Model:
     def embed(self, ids: torch.Tensor) -> torch.Tensor:
         return self.b.embedding(self._w("embed_tokens.weight"), ids.to(self.b.device, non_blocking=True))
 
+    def _qkvg(self, i: int):
+        """Fused [query(Hq*d) ; k ; v ; gate(Hq*d)] projection. q_proj interleaves [query_h | gate_h] per head."""
+        c, p = self.config, f"layers.{i}.self_attn."
+        Hq, d = c.num_attention_heads, c.head_dim
+
+        def build():
+            wq = self.weights.get(P + p + "q_proj.weight")
+            rows = torch.arange(2 * Hq * d).view(Hq, 2, d)
+            return concat_rows([_rows(wq, rows[:, 0].flatten()), self.weights.get(P + p + "k_proj.weight"),
+                                self.weights.get(P + p + "v_proj.weight"), _rows(wq, rows[:, 1].flatten())])
+        return self._fused(p + "qkvg.weight", build)
+
     def full_attention(self, i: int, x, positions, state: HybridState | None, start: int, residual):
         c, b = self.config, self.b
         p = f"layers.{i}.self_attn."
         T, Hq, Hkv, d = x.shape[0], c.num_attention_heads, c.num_key_value_heads, c.head_dim
 
-        def build():                                   # [query(2048) ; k(512) ; v(512) ; gate(2048)] stacked
-            wq = self.weights.get(P + p + "q_proj.weight")
-            rows = torch.arange(2 * Hq * d).view(Hq, 2, d)          # q_proj interleaves [query_h | gate_h] per head
-            parts = [_rows(wq, rows[:, 0].flatten()), self.weights.get(P + p + "k_proj.weight"),
-                     self.weights.get(P + p + "v_proj.weight"), _rows(wq, rows[:, 1].flatten())]
-            return concat_rows(parts)
-
-        y = b.linear(x, self._fused(p + "qkvg.weight", build))
+        y = b.linear(x, self._qkvg(i))
         q = y[:, : Hq * d].reshape(T, Hq, d)
         k = y[:, Hq * d:(Hq + Hkv) * d].reshape(T, Hkv, d)
         v = y[:, (Hq + Hkv) * d:(Hq + 2 * Hkv) * d].reshape(T, Hkv, d)
@@ -187,3 +192,57 @@ class Qwen35Model:
         if capture is not None:
             capture["final_norm"] = h
         return self.b.linear(h, self._w("embed_tokens.weight"))                            # tied output head
+
+    def decode_batch(self, tokens: list[int], states: list) -> torch.Tensor:
+        """One decode step for B independent sequences -> logits [B, vocab].
+
+        Projections and MLPs run batched ([B, K] x [K, N]: each weight read once per step for everyone).
+        Per-sequence parts: attention over each KV history, and each DeltaNet layer's recurrent/conv state.
+        """
+        c, b = self.config, self.b
+        B, Hq, Hkv, d = len(tokens), c.num_attention_heads, c.num_key_value_heads, c.head_dim
+        H, dk, dv = c.linear_num_value_heads, c.linear_key_head_dim, c.linear_value_head_dim
+        for st in states:
+            st.reserve(st.length + 1)
+        starts = [st.length for st in states]
+        positions = torch.tensor(starts, device=b.device, dtype=torch.int32)
+        h = self.embed(torch.tensor(tokens))
+        for i in range(c.num_hidden_layers):
+            x = b.rms_norm(h, self._vec(f"layers.{i}.input_layernorm.weight", one_plus=True), c.rms_norm_eps)
+            if c.layer_types[i] == "full_attention":
+                p = f"layers.{i}.self_attn."
+                y = b.linear(x, self._qkvg(i))
+                q = b.rms_norm(y[:, : Hq * d].reshape(B, Hq, d), self._vec(p + "q_norm.weight", one_plus=True), c.rms_norm_eps)
+                k = b.rms_norm(y[:, Hq * d:(Hq + Hkv) * d].reshape(B, Hkv, d), self._vec(p + "k_norm.weight", one_plus=True), c.rms_norm_eps)
+                v = y[:, (Hq + Hkv) * d:(Hq + 2 * Hkv) * d].reshape(B, Hkv, d)
+                gate = y[:, (Hq + 2 * Hkv) * d:]
+                r = c.rotary_dim
+                qk = b.rope(torch.cat([q[..., :r], k[..., :r]], dim=1).contiguous(), positions, c.rope_theta)
+                q = torch.cat([qk[:, :Hq], q[..., r:]], dim=-1)
+                k = torch.cat([qk[:, Hq:], k[..., r:]], dim=-1)
+                outs = []
+                for j, st in enumerate(states):
+                    st.kv.write(self.slot[i], starts[j], k[j:j + 1], v[j:j + 1])
+                    K, V = st.kv.read(self.slot[i], starts[j] + 1)
+                    outs.append(b.attention(q[j:j + 1].contiguous(), K, V, causal=True))
+                o = torch.cat(outs).reshape(B, Hq * d) * torch.sigmoid(gate)
+                h = b.linear(o, self._w(p + "o_proj.weight"), residual=h)
+            else:
+                p = f"layers.{i}.linear_attn."
+                names = ["in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"]
+                y = b.linear(x, self._fused(p + "in_proj.weight",
+                                            lambda: concat_rows([self.weights.get(P + p + n + ".weight") for n in names])))
+                qkv, z = y[:, : self.conv_dim], y[:, self.conv_dim:self.conv_dim + self.value_dim]
+                beta_logit, a = y[:, -2 * H:-H], y[:, -H:]
+                conv_w = self._vec(p + "conv1d.weight").squeeze(1)
+                outs = [b.deltanet_decode(qkv[j:j + 1], z[j:j + 1], beta_logit[j:j + 1], a[j:j + 1], st, self.slot[i],
+                                          conv_w, self._vec(p + "A_log"), self._vec(p + "dt_bias"),
+                                          self._vec(p + "norm.weight"), c.rms_norm_eps, (H, dk, dv, self.key_dim))
+                        for j, st in enumerate(states)]
+                h = b.linear(torch.cat(outs), self._w(p + "out_proj.weight"), residual=h)
+            x = b.rms_norm(h, self._vec(f"layers.{i}.post_attention_layernorm.weight", one_plus=True), c.rms_norm_eps)
+            h = self.mlp(i, x, residual=h)
+        for st in states:
+            st.advance(1)
+        h = b.rms_norm(h, self._vec("norm.weight", one_plus=True), c.rms_norm_eps)
+        return b.linear(h, self._w("embed_tokens.weight"))

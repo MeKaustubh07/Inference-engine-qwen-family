@@ -12,6 +12,8 @@ from quant import QuantTensor, load_policy, quantize, scheme_for
 
 KERNEL_DIR = Path(__file__).resolve().parent.parent / "kernels"
 TG = 256                                                   # threads per threadgroup for row-parallel kernels
+MAX_BATCH = 8                                              # rows one batched matvec dispatch handles (MAX_BATCH in MSL)
+KERNEL_ROWS = 4 * MAX_BATCH                                # up to here: batched kernels in groups; beyond: GEMM
 DEQUANT_CHUNK = 1 << 23                                    # weights dequantized per prefill GEMM piece (32 MB fp32)
 
 
@@ -46,10 +48,17 @@ class MetalBackend(TorchBackend):
             return table.dequantize(rows=ids.to(self.device))
         return super().embedding(table, ids)
 
+    def _groups(self, fn, x, w, b, residual):
+        """Rows MAX_BATCH at a time through a batched kernel (each group reads the weights once)."""
+        return torch.cat([fn(x[i:i + MAX_BATCH], w, b, None if residual is None else residual[i:i + MAX_BATCH])
+                          for i in range(0, x.shape[0], MAX_BATCH)])
+
     def _qlinear(self, x, w: QuantTensor, b=None, residual=None):
         M = x.shape[0]
         N, K = w.shape
-        if M != 1:                                         # prefill: dequantize on the GPU, tuned GEMM
+        if MAX_BATCH < M <= KERNEL_ROWS:
+            return self._groups(self._qlinear, x, w, b, residual)
+        if M > KERNEL_ROWS:                                # prefill: dequantize on the GPU, tuned GEMM
             # in row chunks: dequantizing the whole matrix at once would need several GB of fp32 temporaries
             # for the 248k-row tied head
             x, step = x.float(), max(1, DEQUANT_CHUNK // K)
@@ -60,26 +69,38 @@ class MetalBackend(TorchBackend):
             if b is not None:
                 y = y + b.float()
             return y + residual if residual is not None else y
-        y = torch.empty(1, N, device=self.device)
+        y = torch.empty(M, N, device=self.device)
         res = residual.float().contiguous() if residual is not None else self._no_res
         args = (y, w.data, w.scales, x.float().contiguous(), b if b is not None else self._no_bias, res,
                 K, N, int(b is not None), int(residual is not None))
-        if w.scheme == "int8":
-            self.lib.matvec_q8(*args, threads=N * 32, group_size=TG)
+        if M == 1:                                         # single-sequence decode
+            if w.scheme == "int8":
+                self.lib.matvec_q8(*args, threads=N * 32, group_size=TG)
+            else:
+                self.lib.matvec_q4(*args, w.mins, threads=N * 32, group_size=TG)
+        elif w.scheme == "int8":                           # batched decode: weights read once for all M rows
+            self.lib.matvec_q8_batch(*args, M, threads=N * 32, group_size=TG)
         else:
-            self.lib.matvec_q4(*args, w.mins, threads=N * 32, group_size=TG)
+            self.lib.matvec_q4_batch(*args, w.mins, M, threads=N * 32, group_size=TG)
         return y
 
     def linear(self, x, w, b=None, residual=None):
         if isinstance(w, QuantTensor):
             return self._qlinear(x, w, b, residual)
-        if x.shape[0] != 1 or w.dtype != torch.bfloat16:
+        M = x.shape[0]
+        if M > KERNEL_ROWS or w.dtype != torch.bfloat16:
             return super().linear(x, w, b, residual)       # prefill: tuned GEMM
+        if M > MAX_BATCH:
+            return self._groups(self.linear, x, w, b, residual)
         N, K = w.shape
-        y = torch.empty(1, N, device=self.device)
+        y = torch.empty(M, N, device=self.device)
         res = residual.float().contiguous() if residual is not None else self._no_res
-        self.lib.matvec_bf16(y, w, x.float().contiguous(), b if b is not None else self._no_bias, res,
-                             K, N, int(b is not None), int(residual is not None), threads=N * 32, group_size=TG)
+        args = (y, w, x.float().contiguous(), b if b is not None else self._no_bias, res,
+                K, N, int(b is not None), int(residual is not None))
+        if M == 1:
+            self.lib.matvec_bf16(*args, threads=N * 32, group_size=TG)
+        else:                                              # batched decode: fp32 activations, weights read once
+            self.lib.matvec_bf16_batch(*args, M, threads=N * 32, group_size=TG)
         return y
 
     def gemm(self, x, w):
@@ -98,7 +119,9 @@ class MetalBackend(TorchBackend):
             F = w_gate_up.shape[0] // 2
             return self.silu_mul(y[:, :F], y[:, F:])
         if x.shape[0] != 1 or w_gate_up.dtype != torch.bfloat16:
-            return super().swiglu(x, w_gate_up)
+            y = self.linear(x, w_gate_up)                  # batched kernel for small M, GEMM for prefill
+            F = w_gate_up.shape[0] // 2
+            return self.silu_mul(y[:, :F], y[:, F:])
         F, K = w_gate_up.shape[0] // 2, w_gate_up.shape[1]
         out = torch.empty(1, F, device=self.device)
         self.lib.matvec_swiglu_bf16(out, w_gate_up, x.float().contiguous(), K, F, threads=F * 32, group_size=TG)

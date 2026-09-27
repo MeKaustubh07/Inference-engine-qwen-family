@@ -5,6 +5,8 @@ import torch
 
 from ops import softmax
 
+MIN_TEMPERATURE = 1e-5
+
 
 @dataclass
 class SamplingParams:
@@ -25,13 +27,17 @@ def sample(logits: torch.Tensor, prev_ids: list[int], params: SamplingParams,
         s = x[seen]
         x[seen] = torch.where(s > 0, s / params.repetition_penalty, s * params.repetition_penalty)
 
-    if params.temperature <= 0:
+    if params.temperature < MIN_TEMPERATURE:       # 0 means greedy; so does anything small enough to overflow x / t
         return int(x.argmax())
     x = x / params.temperature
 
-    if params.top_k > 0:
-        kth = torch.topk(x, min(params.top_k, x.numel())).values[-1]
-        x = x.masked_fill(x < kth, float("-inf"))
+    ids = None
+    if 0 < params.top_k < x.numel():
+        # keep the candidates (ties at the k-th value included, like HF) and work on them only: sorting the full
+        # 248k vocabulary for top-p on every token would dominate the step time
+        kth = torch.topk(x, params.top_k).values[-1]
+        ids = torch.nonzero(x >= kth).flatten()
+        x = x[ids]
 
     if params.top_p < 1.0:
         order = torch.argsort(x, descending=True)
@@ -42,4 +48,5 @@ def sample(logits: torch.Tensor, prev_ids: list[int], params: SamplingParams,
         x[order[drop]] = float("-inf")
 
     probs = softmax(x)
-    return int(torch.multinomial(probs, 1, generator=generator))
+    i = int(torch.multinomial(probs, 1, generator=generator))
+    return int(ids[i]) if ids is not None else i

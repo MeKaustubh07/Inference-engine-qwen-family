@@ -58,3 +58,73 @@ kernel void matvec_q4(device float* y           [[buffer(0)]],
     acc = simd_sum(acc);
     if (lane == 0) y[row] = acc + (has_bias ? float(b[row]) : 0.0f) + (has_res ? res[row] : 0.0f);
 }
+
+// Batched decode (continuous batching): M <= 8 sequences share one pass over the weights. Each weight block is
+// read and dequantized once, then dotted with all M activation rows, so the dominant cost (weight bandwidth)
+// is paid once per step instead of once per sequence. x and y are row-major [M, K] and [M, N].
+// MAX_BATCH is defined in matvec.metal.
+
+kernel void matvec_q8_batch(device float* y           [[buffer(0)]],
+                            device const char4* W     [[buffer(1)]],
+                            device const half* scales [[buffer(2)]],
+                            device const float4* x    [[buffer(3)]],
+                            device const bfloat* b    [[buffer(4)]],
+                            device const float* res   [[buffer(5)]],
+                            constant uint& K          [[buffer(6)]],
+                            constant uint& N          [[buffer(7)]],
+                            constant uint& has_bias   [[buffer(8)]],
+                            constant uint& has_res    [[buffer(9)]],
+                            constant uint& M          [[buffer(10)]],
+                            uint gid  [[thread_position_in_grid]],
+                            uint lane [[thread_index_in_simdgroup]]) {
+    uint row = gid / 32;
+    if (row >= N) return;
+    device const char4* wr = W + (ulong)row * (K / 4);
+    device const half* sr = scales + (ulong)row * (K / 32);
+    float acc[MAX_BATCH] = {0.0f};
+    for (uint j = lane; j < K / 4; j += 32) {
+        float4 w = float4(wr[j]) * float(sr[j / 8]);
+        for (uint m = 0; m < M; m++) acc[m] += dot(w, x[m * (K / 4) + j]);
+    }
+    for (uint m = 0; m < M; m++) {
+        float a = simd_sum(acc[m]);
+        if (lane == 0) y[m * N + row] = a + (has_bias ? float(b[row]) : 0.0f) + (has_res ? res[m * N + row] : 0.0f);
+    }
+}
+
+kernel void matvec_q4_batch(device float* y           [[buffer(0)]],
+                            device const uchar4* W    [[buffer(1)]],
+                            device const half* scales [[buffer(2)]],
+                            device const float4* x    [[buffer(3)]],
+                            device const bfloat* b    [[buffer(4)]],
+                            device const float* res   [[buffer(5)]],
+                            constant uint& K          [[buffer(6)]],
+                            constant uint& N          [[buffer(7)]],
+                            constant uint& has_bias   [[buffer(8)]],
+                            constant uint& has_res    [[buffer(9)]],
+                            device const half* mins   [[buffer(10)]],
+                            constant uint& M          [[buffer(11)]],
+                            uint gid  [[thread_position_in_grid]],
+                            uint lane [[thread_index_in_simdgroup]]) {
+    uint row = gid / 32;
+    if (row >= N) return;
+    device const uchar4* wr = W + (ulong)row * (K / 8);
+    device const half* sr = scales + (ulong)row * (K / 32);
+    device const half* mr = mins + (ulong)row * (K / 32);
+    float acc[MAX_BATCH] = {0.0f};
+    for (uint j = lane; j < K / 8; j += 32) {
+        uchar4 p = wr[j];
+        float4 lo = float4(p & 0x0F), hi = float4(p >> 4);
+        float s = float(sr[j / 4]), mn = float(mr[j / 4]);
+        float4 wa = float4(lo.x, hi.x, lo.y, hi.y) * s + mn;       // dequantize 8 weights once for all M rows
+        float4 wb = float4(lo.z, hi.z, lo.w, hi.w) * s + mn;
+        for (uint m = 0; m < M; m++) {
+            device const float4* xm = x + m * (K / 4);
+            acc[m] += dot(wa, xm[2 * j]) + dot(wb, xm[2 * j + 1]);
+        }
+    }
+    for (uint m = 0; m < M; m++) {
+        float a = simd_sum(acc[m]);
+        if (lane == 0) y[m * N + row] = a + (has_bias ? float(b[row]) : 0.0f) + (has_res ? res[m * N + row] : 0.0f);
+    }
+}

@@ -37,6 +37,10 @@ class Qwen2Model:
         return PagedKVPool(cfg.num_hidden_layers, cfg.num_key_value_heads, cfg.head_dim, num_blocks, block_size,
                            device=self.b.device, dtype=torch.float32)
 
+    def new_paged_state(self, pool: PagedKVPool):
+        """A fresh per-sequence state backed by the shared paged pool (same call for every model family)."""
+        return pool.new_sequence()
+
     def embed(self, ids: torch.Tensor) -> torch.Tensor:
         """Token ids [T] -> vectors [T, hidden]: row lookup in the resident (tied) embedding table.
 
@@ -124,3 +128,40 @@ class Qwen2Model:
         h = self.b.rms_norm(h, self._w("model.norm.weight"), self.config.rms_norm_eps)
         # Tied embeddings: the table that turned ids into vectors now scores vectors against every token.
         return self.b.linear(h, self._w("model.embed_tokens.weight"))
+
+    def decode_batch(self, tokens: list[int], states: list) -> torch.Tensor:
+        """One decode step for B independent sequences -> logits [B, vocab].
+
+        Projections and the MLP run as one [B, K] x [K, N] product, so every weight is read once for the whole
+        batch (the throughput win of batching). Attention stays per sequence: each has its own KV history.
+        """
+        cfg, b = self.config, self.b
+        B, Hq, Hkv, d = len(tokens), cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim
+        for st in states:
+            st.reserve(st.length + 1)
+        starts = [st.length for st in states]
+        positions = torch.tensor(starts, device=b.device, dtype=torch.int32)
+        h = self.embed(torch.tensor(tokens))
+        for layer in range(cfg.num_hidden_layers):
+            p = f"model.layers.{layer}."
+            a = p + "self_attn."
+            x = b.rms_norm(h, self._w(p + "input_layernorm.weight"), cfg.rms_norm_eps)
+            names = ["q_proj", "k_proj", "v_proj"]
+            qkv = b.linear(x, self._fused(a + "qkv.weight", [a + n + ".weight" for n in names]),
+                           self._fused(a + "qkv.bias", [a + n + ".bias" for n in names]))
+            q = qkv[:, : Hq * d].reshape(B, Hq, d)
+            k = qkv[:, Hq * d:(Hq + Hkv) * d].reshape(B, Hkv, d)
+            v = qkv[:, (Hq + Hkv) * d:].reshape(B, Hkv, d)
+            qk = b.rope(torch.cat([q, k], dim=1), positions, cfg.rope_theta)       # row i rotated by its own position
+            q, k = qk[:, :Hq], qk[:, Hq:]
+            outs = []
+            for i, st in enumerate(states):
+                st.write(layer, starts[i], k[i:i + 1], v[i:i + 1])
+                K, V = st.read(layer, starts[i] + 1)
+                outs.append(b.attention(q[i:i + 1].contiguous(), K, V, causal=True))
+            h = b.linear(torch.cat(outs).reshape(B, -1), self._w(a + "o_proj.weight"), residual=h)
+            h = self.mlp(layer, b.rms_norm(h, self._w(p + "post_attention_layernorm.weight"), cfg.rms_norm_eps), residual=h)
+        for st in states:
+            st.advance(1)
+        h = b.rms_norm(h, self._w("model.norm.weight"), cfg.rms_norm_eps)
+        return b.linear(h, self._w("model.embed_tokens.weight"))
