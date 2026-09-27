@@ -85,9 +85,15 @@ class PagedSequence:
         self.length = 0
 
     def _ensure(self, end: int) -> None:
+        """Grow the block table to cover `end` positions. All-or-nothing: if the pool can't supply every block
+        needed, raise before taking any, so a failed request never holds blocks (no hold-and-wait deadlock)."""
         bs = self.pool.block_size
-        while len(self.block_table) * bs < end:
-            self.block_table.append(self.pool.allocator.allocate())
+        need = -(-end // bs) - len(self.block_table)
+        if need <= 0:
+            return
+        if need > self.pool.allocator.num_free:
+            raise OutOfBlocks(f"need {need} more KV blocks, only {self.pool.allocator.num_free} free")
+        self.block_table.extend(self.pool.allocator.allocate() for _ in range(need))
 
     def write(self, layer: int, start: int, k: torch.Tensor, v: torch.Tensor) -> None:
         end = start + k.shape[0]

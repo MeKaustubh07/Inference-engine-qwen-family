@@ -34,8 +34,11 @@ def run(ids, state, split):
         parts.append(model.forward(ids[t:t + 1], state=state))
     return torch.cat(parts)
 
-# 2. paged (block_size 4, so every prompt spans several blocks with ragged ends) == contiguous
+# 2. paged (block_size 4, so every prompt spans several blocks with ragged ends) == contiguous.
+#    Scramble the free list first so block tables come out NON-monotonic, like a pool that has recycled blocks.
 pool = model.new_paged_pool(num_blocks=64, block_size=4)
+taken = [pool.allocator.allocate() for _ in range(10)]
+pool.allocator.free([taken[i] for i in (7, 2, 9, 0, 5, 3, 8, 1, 6, 4)])
 for i in range(5):
     ids = torch.load(f"tests/golden/{i}.pt")["ids"]
     split = max(1, len(ids) // 2)
@@ -43,9 +46,24 @@ for i in range(5):
     seq = pool.new_sequence()
     paged = run(ids, seq, split)
     d = (paged - ref).abs().max().item()
-    check(f"prompt {i} ({len(ids)} tokens, {len(seq.block_table)} blocks): paged == contiguous, max|diff|={d:.1e}", d < 1e-4)
+    blocks_ok = len(seq.block_table) == -(-len(ids) // 4)
+    check(f"prompt {i} ({len(ids)} tokens, table {seq.block_table}): paged == contiguous, max|diff|={d:.1e}, "
+          f"exactly ceil(len/4) blocks", d < 1e-4 and blocks_ok and (len(seq.block_table) < 2 or seq.block_table != sorted(seq.block_table)))
     seq.free()
 check("all blocks returned to the pool after freeing", pool.allocator.num_free == 64)
+
+# 2b. running out of blocks is all-or-nothing: the failed request holds nothing, others keep working
+small = model.new_paged_pool(num_blocks=4, block_size=4)
+sa0 = small.new_sequence(); model.forward(torch.load("tests/golden/2.pt")["ids"], state=sa0)      # 4 tokens -> 1 block
+sb0 = small.new_sequence()
+try:
+    model.forward(torch.load("tests/golden/3.pt")["ids"].repeat(2), state=sb0); failed = False     # 20 tokens -> 5 blocks
+except OutOfBlocks:
+    failed = True
+check(f"OutOfBlocks raised before taking anything (failed request holds {len(sb0.block_table)} blocks, {small.allocator.num_free} still free)",
+      failed and sb0.block_table == [] and small.allocator.num_free == 3)
+model.forward(torch.tensor([13]), state=sa0)
+check("the other sequence can still decode after the failure", sa0.length == 5)
 
 # 3. two sequences interleaved in one pool don't disturb each other
 ids_a = torch.load("tests/golden/3.pt")["ids"]; ids_b = torch.load("tests/golden/4.pt")["ids"]

@@ -27,7 +27,7 @@ def generate_greedy(model, tokenizer, prompt: str, max_new_tokens: int, eos_ids:
         if next_id in eos_ids:
             break
         new.append(next_id)
-        if use_cache:
+        if use_cache and len(new) < max_new_tokens:                   # no forward after the last token
             logits = _next_logits(model, tokenizer, [next_id], state)  # decode: one token, cached context
     return new
 
