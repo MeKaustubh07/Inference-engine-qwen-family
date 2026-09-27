@@ -8,6 +8,7 @@ from pathlib import Path
 import torch
 
 from backend.torch_ref import TorchBackend
+from quant import QuantTensor, load_policy, quantize, scheme_for
 
 KERNEL_DIR = Path(__file__).resolve().parent.parent / "kernels"
 TG = 256                                                   # threads per threadgroup for row-parallel kernels
@@ -20,14 +21,50 @@ def load_library():
 
 
 class MetalBackend(TorchBackend):
-    def __init__(self):
+    """scheme=None keeps bf16 weights; "int8" / "int4" quantizes every 2-D weight (or accepts pre-quantized
+    QuantTensors from a .qt file) and runs decode through the quantized matvec kernels."""
+
+    def __init__(self, scheme: str | None = None, policy: str | None = None):
         super().__init__("mps", torch.bfloat16)
-        self.name = "metal-kernels-bf16"
+        self.scheme = scheme
+        self.keep_int8 = load_policy(policy)              # INT4 mode: tensors measured too sensitive stay INT8
+        self.name = f"metal-kernels-{scheme or 'bf16'}"
         self.lib = load_library()
         self._no_bias = torch.zeros(1, dtype=torch.bfloat16, device=self.device)
         self._no_res = torch.zeros(1, device=self.device)
 
+    def prepare(self, w, name=None):
+        if isinstance(w, QuantTensor):
+            return w.to(self.device)
+        if self.scheme and w.ndim == 2 and w.shape[1] % 32 == 0:
+            return quantize(w, scheme_for(name, self.scheme, self.keep_int8)).to(self.device)
+        return super().prepare(w, name)
+
+    def embedding(self, table, ids):
+        if isinstance(table, QuantTensor):
+            return table.dequantize(rows=ids.to(self.device))
+        return super().embedding(table, ids)
+
+    def _qlinear(self, x, w: QuantTensor, b=None, residual=None):
+        if x.shape[0] != 1:                                # prefill: dequantize on the GPU, tuned GEMM
+            y = x.float() @ w.dequantize().T
+            if b is not None:
+                y = y + b.float()
+            return y + residual if residual is not None else y
+        N, K = w.shape
+        y = torch.empty(1, N, device=self.device)
+        res = residual.float().contiguous() if residual is not None else self._no_res
+        args = (y, w.data, w.scales, x.float().contiguous(), b if b is not None else self._no_bias, res,
+                K, N, int(b is not None), int(residual is not None))
+        if w.scheme == "int8":
+            self.lib.matvec_q8(*args, threads=N * 32, group_size=TG)
+        else:
+            self.lib.matvec_q4(*args, w.mins, threads=N * 32, group_size=TG)
+        return y
+
     def linear(self, x, w, b=None, residual=None):
+        if isinstance(w, QuantTensor):
+            return self._qlinear(x, w, b, residual)
         if x.shape[0] != 1 or w.dtype != torch.bfloat16:
             return super().linear(x, w, b, residual)       # prefill: tuned GEMM
         N, K = w.shape
@@ -48,6 +85,10 @@ class MetalBackend(TorchBackend):
         return y
 
     def swiglu(self, x, w_gate_up):
+        if isinstance(w_gate_up, QuantTensor):
+            y = self._qlinear(x, w_gate_up)
+            F = w_gate_up.shape[0] // 2
+            return self.silu_mul(y[:, :F], y[:, F:])
         if x.shape[0] != 1 or w_gate_up.dtype != torch.bfloat16:
             return super().swiglu(x, w_gate_up)
         F, K = w_gate_up.shape[0] // 2, w_gate_up.shape[1]

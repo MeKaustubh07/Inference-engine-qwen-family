@@ -80,7 +80,7 @@ def main() -> None:
 
     backend = {"cpu": lambda: TorchBackend("cpu", torch.float32), "mps": lambda: TorchBackend("mps", torch.bfloat16),
                "metal": MetalBackend, "metal-int8": lambda: MetalBackend("int8"),
-               "metal-int4": lambda: MetalBackend("int4")}[a.backend]()
+               "metal-int4": lambda: MetalBackend("int4", "configs/quant/qwen2.5-0.5b.json")}[a.backend]()
     cfg = ModelConfig.from_json(f"{D}/config.json")
     model = Qwen2Model(cfg, SafetensorsFile(f"{D}/model.safetensors"), backend)
     tok = Tokenizer(f"{D}/tokenizer.json")

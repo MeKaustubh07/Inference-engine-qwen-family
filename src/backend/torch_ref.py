@@ -13,7 +13,7 @@ class TorchBackend:
         self.weight_dtype = weight_dtype
         self.name = f"torch-{self.device.type}-{str(weight_dtype).removeprefix('torch.')}"
 
-    def prepare(self, w: torch.Tensor) -> torch.Tensor:
+    def prepare(self, w: torch.Tensor, name: str | None = None) -> torch.Tensor:
         return w.to(device=self.device, dtype=self.weight_dtype)
 
     def linear(self, x, w, b=None, residual=None):
@@ -21,6 +21,9 @@ class TorchBackend:
         if b is not None:
             y = y + b.float()
         return y + residual if residual is not None else y
+
+    def embedding(self, table, ids):
+        return table[ids.to(table.device)].float()
 
     def rms_norm(self, x, w, eps):
         return ops.rms_norm(x, w, eps)

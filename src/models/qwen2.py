@@ -3,6 +3,7 @@ import torch
 
 from backend.torch_ref import TorchBackend
 from config import ModelConfig
+from quant import concat_rows
 from state import ContiguousKVCache, PagedKVPool
 from weight_loader import SafetensorsFile
 
@@ -12,19 +13,18 @@ class Qwen2Model:
         self.config = config
         self.weights = weights
         self.b = backend or TorchBackend()                              # default: fp32 CPU reference
-        self.embed_table = weights.get("model.embed_tokens.weight")   # [vocab, hidden], bf16 view
         self._cache: dict[str, torch.Tensor] = {}
 
     def _w(self, name: str) -> torch.Tensor:
         """Fetch a weight by name, convert it once into the backend's resident format, and keep it."""
         if name not in self._cache:
-            self._cache[name] = self.b.prepare(self.weights.get(name))
+            self._cache[name] = self.b.prepare(self.weights.get(name), name)
         return self._cache[name]
 
     def _fused(self, key: str, names: list[str]) -> torch.Tensor:
         """Stack several weights row-wise into one resident tensor (e.g. q/k/v -> one projection)."""
         if key not in self._cache:
-            self._cache[key] = self.b.prepare(torch.cat([self.weights.get(n) for n in names], dim=0))
+            self._cache[key] = self.b.prepare(concat_rows([self.weights.get(n) for n in names]), key)
         return self._cache[key]
 
     def new_state(self, max_len: int) -> ContiguousKVCache:
@@ -38,14 +38,11 @@ class Qwen2Model:
                            device=self.b.device, dtype=torch.float32)
 
     def embed(self, ids: torch.Tensor) -> torch.Tensor:
-        """Token ids [T] -> vectors [T, hidden]: row lookup in the embedding table.
+        """Token ids [T] -> vectors [T, hidden]: row lookup in the resident (tied) embedding table.
 
-        The lookup runs where the table lives. On the GPU backends that is the resident (tied) table, so
-        no row is copied from the CPU (a CPU->GPU copy would wait for all queued GPU work)."""
-        if self.b.device.type == "cpu":
-            return self.embed_table[ids].float()
-        table = self._w("model.embed_tokens.weight")
-        return table[ids.to(self.b.device, non_blocking=True)].float()
+        The lookup runs where the table lives, so on the GPU no row is copied from the CPU
+        (a CPU->GPU copy of fresh data waits for all queued GPU work)."""
+        return self.b.embedding(self._w("model.embed_tokens.weight"), ids.to(self.b.device, non_blocking=True))
 
     def self_attn(self, layer: int, x: torch.Tensor, positions: torch.Tensor | None = None,
                   state: ContiguousKVCache | None = None, residual: torch.Tensor | None = None,

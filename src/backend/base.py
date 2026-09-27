@@ -12,12 +12,16 @@ class Backend(Protocol):
     name: str
     device: torch.device
 
-    def prepare(self, w: torch.Tensor) -> torch.Tensor:
-        """Move/convert one weight tensor into this backend's resident format (called once per weight)."""
+    def prepare(self, w: torch.Tensor, name: str | None = None):
+        """Move/convert one weight into this backend's resident format (called once per weight).
+        `name` lets a backend apply per-tensor policy, e.g. keep the embedding at higher precision."""
 
     def linear(self, x: torch.Tensor, w: torch.Tensor, b: torch.Tensor | None = None,
                residual: torch.Tensor | None = None) -> torch.Tensor:
         """x [T, K] @ w[N, K].T (+ b) (+ residual) -> [T, N] in fp32. T == 1 is the decode matvec."""
+
+    def embedding(self, table, ids: torch.Tensor) -> torch.Tensor:
+        """Rows `ids` of the (possibly quantized) embedding table, as fp32 [T, hidden]."""
 
     def rms_norm(self, x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
         """[..., D] -> [..., D]"""
