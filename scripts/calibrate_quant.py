@@ -1,32 +1,28 @@
-"""Measure INT4 sensitivity per weight tensor and write a mixed-precision policy.
+"""Measure INT4 sensitivity per weight tensor and write a mixed-precision policy (any supported model).
 
 For each 2-D weight, quantize ONLY that tensor to INT4 (everything else bf16) and measure the KL divergence of the
-next-token distribution against the HF fp32 goldens, separately at position 0 (the attention-sink first token) and
-at later positions. Tensors whose damage exceeds the threshold stay INT8 in INT4 mode.
+next-token distribution against reference logits (HF goldens), separately at position 0 (the attention-sink first
+token) and at later positions. Tensors whose damage exceeds the threshold stay INT8 in INT4 mode.
 
-usage: calibrate_quant.py [--threshold 0.005] [--out configs/quant/qwen2.5-0.5b.json]
+usage: calibrate_quant.py --model qwen2.5-0.5b|qwen3.5-0.8b|qwen3.5-2b --golden-dir DIR [--threshold 0.005] [--out F]
 """
 import argparse
+import glob
 import json
 import sys
 
 import torch
 
 sys.path.insert(0, "src")
-from backend.torch_ref import TorchBackend
-from config import ModelConfig
-from models.qwen2 import Qwen2Model
+from engine import load_engine
 from ops import softmax
 from quant import quantize
-from weight_loader import SafetensorsFile
-
-D = "models/qwen2.5-0.5b"
 
 
 def kl_scores(model, goldens, vocab):
     pos0, later = 0.0, 0.0
     for g in goldens:
-        p = softmax(g["logits"][:, :vocab]); q = softmax(model.forward(g["ids"]).cpu()[:, :vocab])
+        p = softmax(g["logits"][:, :vocab].float()); q = softmax(model.forward(g["ids"]).cpu()[:, :vocab])
         kl = (p * (torch.log(p + 1e-12) - torch.log(q + 1e-12))).sum(-1)
         pos0 += kl[0].item() / len(goldens); later += kl[1:].mean().item() / len(goldens)
     return pos0, later
@@ -34,27 +30,33 @@ def kl_scores(model, goldens, vocab):
 
 def main() -> None:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--model", default="qwen2.5-0.5b")
+    ap.add_argument("--golden-dir", default="tests/golden")
     ap.add_argument("--threshold", type=float, default=0.005, help="KL damage (nats) above which a tensor stays INT8")
-    ap.add_argument("--out", default="configs/quant/qwen2.5-0.5b.json")
+    ap.add_argument("--out", default=None)
     a = ap.parse_args()
-    device = "mps" if torch.backends.mps.is_available() else "cpu"
-    m = Qwen2Model(ModelConfig.from_json(f"{D}/config.json"), SafetensorsFile(f"{D}/model.safetensors"),
-                   TorchBackend(device, torch.bfloat16))
-    goldens = [torch.load(f"tests/golden/{i}.pt") for i in range(5)]
-    base0, base_later = kl_scores(m, goldens, 151665)                     # also fills the resident cache
+    out = a.out or f"configs/quant/{a.model}.json"
+    eng = load_engine(a.model, "mps")                                    # bf16 weights on the GPU
+    m, vocab = eng.model, eng.tokenizer.vocab_size()
+    goldens = [torch.load(f) for f in sorted(glob.glob(f"{a.golden_dir}/*.pt"))]
+    base0, base_later = kl_scores(m, goldens, vocab)                      # also fills the resident cache
+    keys = [k for k, w in m._cache.items() if isinstance(w, torch.Tensor) and w.ndim == 2
+            and w.dtype == torch.bfloat16 and "embed" not in k]
     damage = {}
-    for key in [k for k in list(m._cache) if m._cache[k].ndim == 2 and "embed" not in k]:
+    for n, key in enumerate(keys):
         orig = m._cache[key]
-        m._cache[key] = quantize(orig.float().cpu(), "int4").dequantize().to(device, torch.bfloat16)
-        k0, kl = kl_scores(m, goldens, 151665)
+        m._cache[key] = quantize(orig.float().cpu(), "int4").dequantize().to(orig.device, torch.bfloat16)
+        k0, kl = kl_scores(m, goldens, vocab)
         damage[key] = {"pos0": round(k0 - base0, 4), "later": round(kl - base_later, 4)}
         m._cache[key] = orig
+        print(f"\r{n + 1}/{len(keys)} tensors measured", end="", flush=True)
     keep = sorted(k for k, v in damage.items() if max(v["pos0"], v["later"]) > a.threshold)
-    policy = {"model": "Qwen2.5-0.5B-Instruct", "scheme": "int4", "threshold_nats": a.threshold,
-              "keep_int8": keep, "always_int8": ["model.embed_tokens.weight"],
-              "damage": dict(sorted(damage.items(), key=lambda kv: -kv[1]["pos0"]))}
-    json.dump(policy, open(a.out, "w"), indent=1)
-    print(f"{len(keep)} of {len(damage)} tensors stay INT8: {keep}\nwrote {a.out}")
+    policy = {"model": a.model, "scheme": "int4", "threshold_nats": a.threshold, "reference": a.golden_dir,
+              "baseline_kl_bf16": {"pos0": round(base0, 4), "later": round(base_later, 4)},
+              "keep_int8": keep, "always_int8": ["embed_tokens.weight"],
+              "damage": dict(sorted(damage.items(), key=lambda kv: -max(kv[1].values())))}
+    json.dump(policy, open(out, "w"), indent=1)
+    print(f"\n{len(keep)} of {len(damage)} tensors stay INT8\nwrote {out}")
 
 
 if __name__ == "__main__":

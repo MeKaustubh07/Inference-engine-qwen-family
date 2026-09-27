@@ -12,6 +12,7 @@ from quant import QuantTensor, load_policy, quantize, scheme_for
 
 KERNEL_DIR = Path(__file__).resolve().parent.parent / "kernels"
 TG = 256                                                   # threads per threadgroup for row-parallel kernels
+DEQUANT_CHUNK = 1 << 23                                    # weights dequantized per prefill GEMM piece (32 MB fp32)
 
 
 def load_library():
@@ -46,12 +47,19 @@ class MetalBackend(TorchBackend):
         return super().embedding(table, ids)
 
     def _qlinear(self, x, w: QuantTensor, b=None, residual=None):
-        if x.shape[0] != 1:                                # prefill: dequantize on the GPU, tuned GEMM
-            y = x.float() @ w.dequantize().T
+        M = x.shape[0]
+        N, K = w.shape
+        if M != 1:                                         # prefill: dequantize on the GPU, tuned GEMM
+            # in row chunks: dequantizing the whole matrix at once would need several GB of fp32 temporaries
+            # for the 248k-row tied head
+            x, step = x.float(), max(1, DEQUANT_CHUNK // K)
+            y = torch.empty(M, N, device=self.device)
+            for r in range(0, N, step):
+                rows = slice(r, min(N, r + step))
+                y[:, rows] = x @ w.dequantize(rows).T
             if b is not None:
                 y = y + b.float()
             return y + residual if residual is not None else y
-        N, K = w.shape
         y = torch.empty(1, N, device=self.device)
         res = residual.float().contiguous() if residual is not None else self._no_res
         args = (y, w.data, w.scales, x.float().contiguous(), b if b is not None else self._no_bias, res,

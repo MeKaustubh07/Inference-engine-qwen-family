@@ -54,10 +54,13 @@ for N, K in ((896, 896), (4864, 896), (896, 4864)):
 
 # 4b. policy names fused tensors; checkpoint component names must map onto them
 from quant import fused_name, scheme_for
-check("fused_name maps q/k/v -> qkv and gate/up -> gate_up",
-      fused_name("model.layers.3.self_attn.k_proj.weight") == "model.layers.3.self_attn.qkv.weight"
-      and fused_name("model.layers.3.mlp.up_proj.weight") == "model.layers.3.mlp.gate_up.weight"
-      and fused_name("model.layers.3.mlp.down_proj.weight") == "model.layers.3.mlp.down_proj.weight")
+from quant import policy_group
+check("policy groups: Qwen2 and Qwen3.5 component and fused names map to one group id",
+      policy_group("model.layers.3.self_attn.k_proj.weight") == policy_group("model.layers.3.self_attn.qkv.weight")
+      == policy_group("layers.3.self_attn.qkvg.weight") == policy_group("model.language_model.layers.3.self_attn.q_proj.weight")
+      == "layers.3.attn_in"
+      and policy_group("model.language_model.layers.5.linear_attn.in_proj_z.weight") == policy_group("layers.5.linear_attn.in_proj.weight")
+      and policy_group("model.layers.3.mlp.down_proj.weight") == "layers.3.mlp.down_proj.weight")
 keep = frozenset({"model.layers.3.self_attn.qkv.weight"})
 check("a kept fused tensor keeps ALL its components int8 (q, k, v)",
       {scheme_for(f"model.layers.3.self_attn.{c}_proj.weight", "int4", keep) for c in "qkv"} == {"int8"})
