@@ -21,8 +21,12 @@ for N, K in ((896, 896), (4864, 896), (151936, 896)):
     y = nm.view(y_h, N).clone()
     ref = W.float() @ x
     rel = (y - ref).abs().max().item() / ref.abs().max().item()
-    gpu_s = nm.matvec(w_h, x_h, y_h, N, K, 50)                    # 50 dispatches, one command buffer
-    check(f"native matvec {N}x{K}: rel diff {rel:.1e} | {gpu_s * 1e6:.0f} us GPU/iter ({N * K * 2 / gpu_s / 1e9:.0f} GB/s)", rel < 1e-3)
+    # cold timing: rotate over enough distinct copies that the set (>= 64 MB) can't live in the on-chip cache
+    copies = max(1, (64 << 20) // (N * K * 2))
+    ws = [w_h] + [nm.upload(W) for _ in range(copies - 1)]
+    t0 = time.perf_counter(); gpu_s = nm.matvec_rotate(ws, x_h, y_h, N, K, 2 * len(ws)); wall = (time.perf_counter() - t0) / (2 * len(ws))
+    check(f"native matvec {N}x{K}: rel diff {rel:.1e} | cold reads over {len(ws)} copies: {gpu_s * 1e6:.0f} us GPU "
+          f"({N * K * 2 / gpu_s / 1e9:.0f} GB/s), {wall * 1e6:.0f} us wall per dispatch", rel < 1e-3)
 
 # the shared buffer really is shared: writing through the torch view is visible to the GPU
 x = torch.zeros(896); x_h = nm.upload(x); nm.view(x_h, 896)[:] = 1.0

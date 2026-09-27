@@ -49,7 +49,7 @@ Memory: peak CPU RSS 678 MiB, Metal driver 2065 MiB. Each row: median of 3 runs 
 | step | decode tok/s | what changed |
 |---|---:|---|
 | PyTorch ops on MPS, bf16 weights (before sync fixes) | ~20 | baseline |
-| hand-written Metal kernels | ~41 | matvec at 77–86 GB/s, fused norm/RoPE/attention |
+| hand-written Metal kernels | ~41 | matvec at 58–83 GB/s with cold weights, fused norm/RoPE/attention |
 | + fused QKV, SwiGLU, residual | ~37–39 (noise) | dispatch count was not the bottleneck |
 | + stop reading `int(positions[0])` from the GPU in every layer | ~68 (profiled) | removed 24 forced CPU-GPU waits per token |
 | + embedding lookup on the GPU (no CPU→GPU copy) | **~73** | removed the last blocking copy |
@@ -60,7 +60,9 @@ Before the last two fixes, CPU issue time (23.1 ms) equalled wall time (23.2 ms)
 
 ## Week 10: the native bridge and a hand-written GEMM
 
-**Native Objective-C++ runtime** (`src/native/metal_runtime.mm`, built by `scripts/build_native.sh`, called through `ctypes`): its own `MTLDevice`, command queue and pipeline; compiles the same `matvec.metal` at runtime; weights in shared unified-memory buffers. Encoding 50 dispatches into one command buffer: 896x896 matvec in 19 us (vs 25 us via PyTorch's per-call dispatch), 4864x896 at 88 GB/s, the 151,936-row output head at 79 GB/s. A CPU write through a Python view of a shared buffer is visible to the GPU with no copy.
+**Native Objective-C++ runtime** (`src/native/metal_runtime.mm`, built by `scripts/build_native.sh`, called through `ctypes`): its own `MTLDevice`, command queue and pipeline; compiles the same `matvec.metal` at runtime; weights in shared unified-memory buffers; a CPU write through a Python view of a shared buffer is visible to the GPU with no copy. Timed with **cold weights** (cycling through enough distinct copies to exceed the on-chip cache, as decode does) and GPU timestamps: 896x896 in 25 us (63 GB/s), 4864x896 in 116 us (75 GB/s), the 151,936-row output head in 3.1 ms (89 GB/s). Both paths run the identical MSL kernel, so on the same clock they perform the same; the native path's value is owning the device/queue/pipeline plumbing, not speed.
+
+*Measurement note (from review):* an earlier version re-read one small matrix in a loop and reported up to 88 GB/s (one run "measured" 235 GB/s, over twice DRAM bandwidth): the matrix was being served from the 8 MB on-chip cache. All matvec numbers here now use cold weights; the PyTorch baseline also no longer does an extra add the real backend never runs.
 
 **Tiled GEMM for prefill** (`src/kernels/gemm.metal`, 16x16 threadgroup tiles): correct to 1e-6 but 0.29 TFLOP/s vs ~1.2 TFLOP/s for PyTorch's MPS GEMM, which uses the GPU's matrix units (`simdgroup_matrix`). Prefill therefore keeps PyTorch's GEMM; decode uses the custom kernels, where they win.
 

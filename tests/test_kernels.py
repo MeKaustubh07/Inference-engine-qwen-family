@@ -49,9 +49,16 @@ for N, K, bias in ((896, 896, True), (128, 896, True), (4864, 896, False), (896,
     x = torch.randn(1, K, device=dev)
     ref = (x @ W.float().T) + (b.float() if bias else 0)
     rel = maxdiff(mb.linear(x, W, b), ref) / ref.abs().max().item()
-    t_ours = bench(lambda: mb.linear(x, W, b)); t_torch = bench(lambda: (x.to(torch.bfloat16) @ W.T).float() + (b.float() if bias else 0))
+    # Timing with COLD weights: cycle through distinct copies totalling >= 64 MB so reads come from DRAM, as in
+    # decode (re-reading one small matrix would be served from the on-chip cache and overstate bandwidth).
+    Ws = [W] + [W.clone() for _ in range(max(1, (64 << 20) // (N * K * 2)) - 1)]
+    it = iter(range(10 ** 9))
+    t_ours = bench(lambda: mb.linear(x, Ws[next(it) % len(Ws)], b), 2 * len(Ws))
+    it = iter(range(10 ** 9))
+    torch_lin = lambda w: (x.to(torch.bfloat16) @ w.T).float() + b.float() if bias else (x.to(torch.bfloat16) @ w.T).float()
+    t_torch = bench(lambda: torch_lin(Ws[next(it) % len(Ws)]), 2 * len(Ws))                 # same work as TorchBackend.linear
     gbps = N * K * 2 / (t_ours * 1e-6) / 1e9
-    check(f"matvec {N}x{K}{' +bias' if bias else ''}: rel diff {rel:.1e} | ours {t_ours:.0f} us ({gbps:.0f} GB/s) vs torch {t_torch:.0f} us", rel < 1e-3)
+    check(f"matvec {N}x{K}{' +bias' if bias else ''}: rel diff {rel:.1e} | cold weights: ours {t_ours:.0f} us ({gbps:.0f} GB/s) vs torch {t_torch:.0f} us", rel < 1e-3)
 
 # tiled GEMM (prefill) vs PyTorch's tuned GEMM, including ragged sizes not divisible by the tile
 for T, N, K in ((7, 896, 896), (64, 4864, 896), (256, 896, 4864), (1024, 1152, 896)):
@@ -74,11 +81,12 @@ t_fused = bench(lambda: mb.swiglu(x, Wgu)); t_split = bench(lambda: mb.silu_mul(
 check(f"fused swiglu: rel diff {rel:.1e} | fused {t_fused:.0f} us vs 3 separate kernels {t_split:.0f} us", rel < 1e-3)
 
 # decode attention: 1 query, S cached positions, 14 query heads sharing 2 KV heads
-for S in (1, 5, 300, 2048):
-    q = torch.randn(1, 14, 64, device=dev); k = torch.randn(S, 2, 64, device=dev); v = torch.randn(S, 2, 64, device=dev)
+for S, scale in ((1, 1), (5, 1), (300, 1), (2048, 1), (300, 30), (2048, 30)):
+    # scale 30 pushes scores past exp()'s fp32 range: only a correct max-subtracting softmax stays finite
+    q = torch.randn(1, 14, 64, device=dev) * scale; k = torch.randn(S, 2, 64, device=dev); v = torch.randn(S, 2, 64, device=dev)
     d = maxdiff(mb.attention(q, k, v), ops.attention(q, k, v, causal=True))
     t_ours = bench(lambda: mb.attention(q, k, v), 100); t_torch = bench(lambda: ops.attention(q, k, v, causal=True), 100)
-    check(f"attention_decode S={S}: max|diff|={d:.1e} | ours {t_ours:.0f} us vs torch ops {t_torch:.0f} us", d < 1e-4)
+    check(f"attention_decode S={S} q-scale {scale}: max|diff|={d:.1e} | ours {t_ours:.0f} us vs torch ops {t_torch:.0f} us", d < 1e-4)
 
 # end to end: the whole model on the Metal backend
 from config import ModelConfig

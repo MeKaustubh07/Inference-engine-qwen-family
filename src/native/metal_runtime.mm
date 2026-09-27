@@ -59,15 +59,18 @@ int mr_alloc(uint64_t nbytes) {
 
 void* mr_contents(int handle) { return g_buffers[handle].contents; }
 
-// y = W . x for W [N, K] bf16 resident in buffer `w`, x/y fp32 buffers. Runs `iters` times in ONE command
-// buffer (encode many dispatches, commit once, wait once) and returns GPU seconds per iteration.
-double mr_matvec_bf16(int w, int x, int y, uint32_t N, uint32_t K, int iters) {
+// y = W . x for W [N, K] bf16, x/y fp32 buffers. Encodes `iters` dispatches in ONE command buffer (commit once,
+// wait once), cycling through the `n_w` weight buffers in `ws` so that, with enough distinct copies, every read
+// comes from DRAM rather than the on-chip cache (decode reads each weight once per token). Returns GPU seconds
+// per dispatch (GPU timestamps: excludes CPU encode/commit time).
+double mr_matvec_bf16_rotate(const int* ws, int n_w, int x, int y, uint32_t N, uint32_t K, int iters) {
     @autoreleasepool {
         uint32_t has_bias = 0, has_res = 0;
         id<MTLCommandBuffer> cb = [g_queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
         [enc setComputePipelineState:g_matvec];
         for (int i = 0; i < iters; ++i) {
+            int w = ws[i % n_w];
             [enc setBuffer:g_buffers[y] offset:0 atIndex:0];
             [enc setBuffer:g_buffers[w] offset:0 atIndex:1];
             [enc setBuffer:g_buffers[x] offset:0 atIndex:2];
@@ -84,6 +87,10 @@ double mr_matvec_bf16(int w, int x, int y, uint32_t N, uint32_t K, int iters) {
         [cb waitUntilCompleted];
         return (cb.GPUEndTime - cb.GPUStartTime) / iters;
     }
+}
+
+double mr_matvec_bf16(int w, int x, int y, uint32_t N, uint32_t K, int iters) {
+    return mr_matvec_bf16_rotate(&w, 1, x, y, N, K, iters);
 }
 
 void mr_shutdown() { g_buffers.clear(); g_matvec = nil; g_library = nil; g_queue = nil; g_device = nil; }

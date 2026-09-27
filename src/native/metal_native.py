@@ -22,6 +22,9 @@ class NativeMetal:
         lib.mr_contents.restype = ctypes.c_void_p
         lib.mr_matvec_bf16.argtypes = [ctypes.c_int] * 3 + [ctypes.c_uint32, ctypes.c_uint32, ctypes.c_int]
         lib.mr_matvec_bf16.restype = ctypes.c_double
+        lib.mr_matvec_bf16_rotate.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                              ctypes.c_uint32, ctypes.c_uint32, ctypes.c_int]
+        lib.mr_matvec_bf16_rotate.restype = ctypes.c_double
         err = ctypes.create_string_buffer(512)
         src = (KERNELS / "matvec.metal").read_bytes()           # the SAME kernel source the torch path uses
         if lib.mr_init(src, b"matvec_bf16", err, 512) != 0:
@@ -45,3 +48,8 @@ class NativeMetal:
 
     def matvec(self, w: int, x: int, y: int, N: int, K: int, iters: int = 1) -> float:
         return self.lib.mr_matvec_bf16(w, x, y, N, K, iters)
+
+    def matvec_rotate(self, ws: list[int], x: int, y: int, N: int, K: int, iters: int) -> float:
+        """GPU seconds per dispatch while cycling through distinct weight buffers (cold, DRAM-bound reads)."""
+        arr = (ctypes.c_int * len(ws))(*ws)
+        return self.lib.mr_matvec_bf16_rotate(arr, len(ws), x, y, N, K, iters)
