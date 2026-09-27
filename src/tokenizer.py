@@ -44,7 +44,11 @@ class Tokenizer:
         self.id_to_token.update({i: t for t, i in self.special.items()})
         self.special_re = regex.compile("(" + "|".join(regex.escape(s) for s in self.special) + ")")
 
-        # The pre-tokenizer regex, taken VERBATIM from the file (the `regex` engine supports (?i:...))
+        # The pre-tokenizer regex, taken VERBATIM from the file (the `regex` engine supports (?i:...)).
+        # Note: for Qwen3.5 checkpoints, transformers' AutoTokenizer resolves to Qwen2Tokenizer (per the checkpoint's
+        # tokenizer_config.json) and substitutes the older Qwen2 regex, which lacks \p{M}; it then splits combining
+        # marks (Hindi, Tamil, Thai, Arabic) differently from this file. The file and transformers' own
+        # Qwen3_5Tokenizer agree with each other, and this engine follows them.
         pattern = spec["pre_tokenizer"]["pretokenizers"][0]["pattern"]["Regex"]
         self.pre_re = regex.compile(pattern)
 

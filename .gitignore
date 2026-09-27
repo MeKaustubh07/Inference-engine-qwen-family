@@ -6,3 +6,4 @@ __pycache__/
 .DS_Store
 tests/golden/
 build/
+tests/golden_qwen35/

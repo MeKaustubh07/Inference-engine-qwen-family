@@ -101,7 +101,8 @@ class MetalBackend(TorchBackend):
         out = torch.empty_like(x)
         d = x.shape[-1]
         rows = x.numel() // d
-        self.lib.rms_norm(out, x, w, float(eps), d, threads=rows * TG, group_size=TG)
+        kernel = self.lib.rms_norm if w.dtype == torch.bfloat16 else self.lib.rms_norm_f32w
+        kernel(out, x, w.to(self.device).contiguous(), float(eps), d, threads=rows * TG, group_size=TG)
         return out
 
     def rope(self, x, positions, theta):
@@ -129,4 +130,16 @@ class MetalBackend(TorchBackend):
         out = torch.empty_like(gate)
         n = gate.numel()
         self.lib.silu_mul(out, gate, up, n, threads=n, group_size=min(TG, n))
+        return out
+
+    def deltanet_decode(self, qkv, z, b, a, state, slot, conv_w, A_log, dt_bias, norm_w, eps, dims):
+        """Fused Metal path: conv_step + gdn_decode (2 dispatches instead of ~20 tensor ops)."""
+        H, dk, dv, key_dim = dims
+        C = qkv.shape[-1]
+        u = torch.empty(C, device=self.device)
+        self.lib.conv_step(u, qkv.float().contiguous(), state.conv_tail, conv_w.contiguous(), C, slot,
+                           threads=C, group_size=TG)
+        out = torch.empty(1, H * dv, device=self.device)
+        self.lib.gdn_decode(out, u, z.float().contiguous(), b.float().contiguous(), a.float().contiguous(),
+                            A_log, dt_bias, norm_w, state.S, H, dk, slot, float(eps), threads=H * dv, group_size=dv)
         return out

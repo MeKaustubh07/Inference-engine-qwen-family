@@ -124,3 +124,33 @@ class PagedSequence:
     def bytes_used(self) -> int:
         p = self.pool
         return 2 * len(self.block_table) * p.k[0, 0].numel() * p.k.shape[0] * p.k.element_size()
+
+
+class HybridState:
+    """SequenceState for hybrid models (Qwen3.5): each layer asks for the kind of state it needs.
+
+    attention layers -> a KV cache (ContiguousKVCache or PagedSequence), indexed by attention-layer slot
+    linear layers    -> a fixed-size recurrent state S [H, dk, dv] (fp32) and the last K-1 raw conv inputs [K-1, C]
+    The linear-layer state never grows with the sequence: that is the point of linear attention.
+    """
+
+    def __init__(self, kv, n_linear: int, n_heads: int, dk: int, dv: int, conv_dim: int, conv_k: int,
+                 device: torch.device | str = "cpu"):
+        self.kv = kv
+        self.S = torch.zeros(n_linear, n_heads, dk, dv, device=device, dtype=torch.float32)
+        self.conv_tail = torch.zeros(n_linear, conv_k - 1, conv_dim, device=device, dtype=torch.float32)
+
+    @property
+    def length(self) -> int:
+        return self.kv.length
+
+    def advance(self, n: int) -> None:
+        self.kv.advance(n)
+
+    def free(self) -> None:
+        if hasattr(self.kv, "free"):
+            self.kv.free()
+
+    def bytes_used(self) -> int:
+        fixed = (self.S.numel() + self.conv_tail.numel()) * 4
+        return self.kv.bytes_used() + fixed

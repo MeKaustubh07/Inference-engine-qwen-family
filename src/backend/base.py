@@ -37,3 +37,13 @@ class Backend(Protocol):
 
     def swiglu(self, x: torch.Tensor, w_gate_up: torch.Tensor) -> torch.Tensor:
         """w_gate_up = [gate; up] stacked [2F, K]: returns silu(x @ gate.T) * (x @ up.T), [T, F]."""
+
+    # ---- protocol v2, added for Qwen3.5 (the port forced the interface to grow)
+    def causal_conv1d(self, x: torch.Tensor, tail: torch.Tensor, w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Depthwise causal conv + SiLU: x [T, C], tail [K-1, C], w [C, K] -> (out [T, C], new tail)."""
+
+    def gated_delta(self, q, k, v, beta, g, S) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gated delta rule: q, k [T, H, dk], v [T, H, dv], beta, g [T, H], S [H, dk, dv] -> (o [T, H, dv], S)."""
+
+    def rms_norm_gated(self, x, z, w, eps) -> torch.Tensor:
+        """RMSNorm(x) * w * silu(z) over the last dim."""

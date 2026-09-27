@@ -1,0 +1,101 @@
+"""Week 13: the Qwen3.5-0.8B port vs the HF fp32 answer key: every layer, logits, greedy decode, cached decode."""
+import sys
+import time
+import torch
+
+sys.path.insert(0, "src")
+from config import Qwen35Config
+from generate import generate_greedy
+from models.qwen3_5 import Qwen35Model
+from tokenizer import Tokenizer
+from weight_loader import SafetensorsFile
+
+D = "models/qwen3.5-0.8b"
+EOS = {248046, 248044}
+cfg = Qwen35Config.from_json(f"{D}/config.json")
+weights = SafetensorsFile(f"{D}/model.safetensors-00001-of-00001.safetensors")
+tok = Tokenizer(f"{D}/tokenizer.json")
+model = Qwen35Model(cfg, weights)                                  # fp32 CPU reference backend
+
+results = []
+def check(name, ok):
+    results.append(bool(ok)); print(f"{'PASS' if ok else 'FAIL'}  {name}")
+
+print(f"layer types: {''.join('A' if t == 'full_attention' else 'L' for t in cfg.layer_types)}  (A = gated attention, L = Gated DeltaNet)")
+for n in range(5):
+    g = torch.load(f"tests/golden_qwen35/{n}.pt")
+    ids = torch.tensor(tok.encode(g["text"]))
+    check(f"prompt {n}: tokenizer ids == HF ids ({len(ids)} tokens)", torch.equal(ids, g["ids"]))
+    cap = {}
+    logits = model.forward(g["ids"], capture=cap)
+    rel = [((cap[f"l{i}_out"] - g[f"l{i}_out"]).abs().max() / g[f"l{i}_out"].abs().max()).item() for i in range(24)]
+    worst = max(range(24), key=lambda i: rel[i])
+    d_logits = (logits - g["logits"]).abs().max().item()
+    agree = (logits.argmax(-1) == g["logits"].argmax(-1)).float().mean().item()
+    check(f"prompt {n}: embed exact, worst layer rel diff {rel[worst]:.1e} (layer {worst}, {cfg.layer_types[worst]}), "
+          f"logits max|diff| {d_logits:.1e}, top-1 agreement {agree:.0%}",
+          torch.equal(cap["embed"], g["embed"]) and max(rel) < 1e-4 and agree == 1.0)
+
+# greedy decoding with the hybrid cache vs HF generate()
+t0 = time.perf_counter()
+for n in range(5):
+    g = torch.load(f"tests/golden_qwen35/{n}.pt")
+    ours = generate_greedy(model, tok, g["text"], 10, EOS)
+    hf = g["greedy"].tolist()
+    check(f"prompt {n}: cached greedy == HF: {tok.decode(ours)!r}", ours == hf)
+print(f"      greedy decoding, 5 prompts x 10 tokens: {time.perf_counter() - t0:.1f}s")
+
+# cached decode == uncached, with contiguous and paged attention caches (and the recurrent state carried)
+g = torch.load("tests/golden_qwen35/4.pt"); ids = g["ids"]
+full = model.forward(ids)
+for kind, st in (("contiguous", model.new_state(len(ids))), ("paged", model.new_paged_state(model.new_paged_pool(16, 4)))):
+    parts = [model.forward(ids[:3], state=st), model.forward(ids[3:8], state=st)] + [model.forward(ids[t:t + 1], state=st) for t in range(8, len(ids))]
+    d = (torch.cat(parts) - full).abs().max().item()
+    check(f"hybrid state ({kind} KV + recurrent/conv state): prefill 3 + chunk 5 + single tokens == uncached, max|diff| {d:.1e}", d < 1e-3)
+
+# Qwen3.5 chat template matches HF's renderer (no default system; empty think block when thinking is off)
+from chat import format_chat
+from transformers import AutoTokenizer
+hf_tok = AutoTokenizer.from_pretrained(D)
+convs = [[{"role": "user", "content": "What is the capital of France?"}],
+         [{"role": "system", "content": "You are terse."}, {"role": "user", "content": "Hi"}],
+         [{"role": "user", "content": "2+2?"}, {"role": "assistant", "content": "4"}, {"role": "user", "content": "and 3+3?"}],
+         [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "<think>\nreasoning\n</think>\n\nhello"}, {"role": "user", "content": "bye"}]]
+for c in convs:
+    for think in (False, True):
+        ok = format_chat(c, style="qwen3.5", enable_thinking=think) == hf_tok.apply_chat_template(c, tokenize=False, add_generation_prompt=True, enable_thinking=think)
+        check(f"qwen3.5 chat template matches HF ({len(c)} messages, thinking {'on' if think else 'off'})", ok)
+
+# fused Metal DeltaNet decode kernels (conv_step + gdn_decode) == the reference composition, over several steps
+if torch.backends.mps.is_available():
+    from backend.metal import MetalBackend
+    from backend.torch_ref import TorchBackend
+    mb, rb = MetalBackend(), TorchBackend("mps", torch.float32)
+    H, dk, dv, KD, C = 16, 128, 128, 2048, 6144
+    gen = torch.Generator().manual_seed(0)
+    r = lambda *s_, scale=1.0: (torch.randn(*s_, generator=gen) * scale).to("mps")
+    conv_w, A_log, dt_bias, norm_w = r(C, 4, scale=0.5), r(H), r(H), 1 + r(dv, scale=0.1)
+    class St: pass
+    sm, sr = St(), St()
+    sm.conv_tail, sm.S = r(3, 3, C), r(3, H, dk, dv, scale=0.05)
+    sr.conv_tail, sr.S = sm.conv_tail.clone(), sm.S.clone()
+    worst = 0.0
+    for step in range(4):                                     # state carried across steps, slot 1 of 3
+        qkv, z, bl, a = r(1, C), r(1, H * dv), r(1, H), r(1, H, scale=3)
+        om = mb.deltanet_decode(qkv, z, bl, a, sm, 1, conv_w, A_log, dt_bias, norm_w, 1e-6, (H, dk, dv, KD))
+        orr = rb.deltanet_decode(qkv, z, bl, a, sr, 1, conv_w, A_log, dt_bias, norm_w, 1e-6, (H, dk, dv, KD))
+        worst = max(worst, (om - orr).abs().max().item() / orr.abs().max().item(),
+                    (sm.S - sr.S).abs().max().item(), (sm.conv_tail - sr.conv_tail).abs().max().item())
+    check(f"fused Metal DeltaNet decode == reference over 4 steps (output rel / state / conv-tail worst {worst:.1e}); other slots untouched",
+          worst < 1e-4 and torch.equal(sm.S[0], sr.S[0]) and torch.equal(sm.S[2], sr.S[2]))
+
+    gm = Qwen35Model(cfg, weights, MetalBackend())
+    match = 0
+    for n in range(5):
+        g = torch.load(f"tests/golden_qwen35/{n}.pt"); out = generate_greedy(gm, tok, g["text"], 10, EOS)
+        match += next((j for j, (x_, y_) in enumerate(zip(out, g["greedy"].tolist())) if x_ != y_), min(len(out), len(g["greedy"])))
+    check(f"Metal backend (bf16 weights): greedy matches HF fp32 for {match}/50 tokens", match >= 45)
+    del gm
+
+print(f"\n{sum(results)}/{len(results)} checks passed")
+sys.exit(0 if all(results) else 1)
