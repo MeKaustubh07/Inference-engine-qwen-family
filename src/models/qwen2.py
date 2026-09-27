@@ -3,7 +3,7 @@ import torch
 
 from backend.torch_ref import TorchBackend
 from config import ModelConfig
-from state import ContiguousKVCache
+from state import ContiguousKVCache, PagedKVPool
 from weight_loader import SafetensorsFile
 
 
@@ -25,6 +25,11 @@ class Qwen2Model:
         cfg = self.config
         return ContiguousKVCache(cfg.num_hidden_layers, cfg.num_key_value_heads, cfg.head_dim, max_len,
                                  device=self.b.device, dtype=torch.float32)
+
+    def new_paged_pool(self, num_blocks: int, block_size: int = 16) -> PagedKVPool:
+        cfg = self.config
+        return PagedKVPool(cfg.num_hidden_layers, cfg.num_key_value_heads, cfg.head_dim, num_blocks, block_size,
+                           device=self.b.device, dtype=torch.float32)
 
     def embed(self, ids: torch.Tensor) -> torch.Tensor:
         """Token ids [T] -> vectors [T, hidden]: row lookup in the embedding table."""
