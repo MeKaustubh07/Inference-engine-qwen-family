@@ -37,7 +37,8 @@ def sample(logits: torch.Tensor, prev_ids: list[int], params: SamplingParams,
         order = torch.argsort(x, descending=True)
         probs = softmax(x[order])
         cum = torch.cumsum(probs, dim=0)
-        drop = cum - probs > params.top_p          # drop tokens once the tokens before them already cover p
+        drop = cum - probs >= params.top_p         # drop a token once the tokens ranked above it already cover p
+        drop[0] = False                            # always keep the most likely token (HF: min_tokens_to_keep=1)
         x[order[drop]] = float("-inf")
 
     probs = softmax(x)

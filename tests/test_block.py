@@ -15,6 +15,7 @@ weights = SafetensorsFile(f"{MODEL_DIR}/model.safetensors")
 model = Qwen2Model(cfg, weights)
 tokenizer = Tokenizer(f"{MODEL_DIR}/tokenizer.json")
 
+all_ok = True
 for i in range(5):
     g = torch.load(f"tests/golden/{i}.pt")
     ids = torch.tensor(tokenizer.encode(g["text"]))
@@ -28,4 +29,7 @@ for i in range(5):
     scale = g["l0_out"].abs().max().item()
 
     ok = d_attn < 1e-3 and d_block < 1e-3 * max(1.0, scale)
+    all_ok &= ok
     print(f"{i}: tokens={len(ids):2d}  attention max|diff|={d_attn:.2e}  block max|diff|={d_block:.2e} (values up to {scale:.1f})  {'PASS' if ok else 'FAIL'}")
+
+sys.exit(0 if all_ok else 1)

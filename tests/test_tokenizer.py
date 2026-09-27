@@ -23,3 +23,4 @@ for s in ["The capital of France is", "Kaustubh", "<|im_start|>user\nhi<|im_end|
     ids = tok.encode(s)
     print(repr(s), "->", ids, "->", [tok.decode([i]) for i in ids])
 print("vocab size:", tok.vocab_size())
+sys.exit(0 if passed == len(cases) else 1)

@@ -26,7 +26,12 @@ for i in range(5):
     print(f"{i}: tokens={len(g['ids']):2d}  logits max|diff|={d:.2e} (values up to {g['logits'].abs().max().item():.1f})  top-1 agreement={agree:.0%}  {'PASS' if ok else 'FAIL'}")
 
 t0 = time.perf_counter()
-new = generate_greedy(model, tokenizer, "The capital of France is", 8, eos_ids={151643, 151645})
-text = tokenizer.decode(new)
-print(f"greedy: 'The capital of France is' -> {text!r}  ({len(new)} tokens in {time.perf_counter() - t0:.1f}s)")
-print("first word is ' Paris':", "PASS" if text.startswith(" Paris") else "FAIL")
+for i in range(5):
+    g = torch.load(f"tests/golden/{i}.pt")
+    ours = generate_greedy(model, tokenizer, g["text"], 10, eos_ids={151643, 151645})
+    hf = g["greedy"].tolist()
+    ok = ours == hf[: len(ours)] and (len(ours) == len(hf) or hf[len(ours)] in {151643, 151645})
+    all_ok &= ok
+    print(f"greedy {i}: {g['text']!r} -> {tokenizer.decode(ours)!r}  {'PASS' if ok else 'FAIL (HF: ' + repr(tokenizer.decode(hf)) + ')'}")
+print(f"greedy decoding for 5 prompts x 10 tokens took {time.perf_counter() - t0:.1f}s")
+sys.exit(0 if all_ok else 1)
