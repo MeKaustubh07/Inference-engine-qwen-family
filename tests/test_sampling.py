@@ -69,17 +69,21 @@ for c in convs:
 
 # 7. streaming with a scripted fake model (no weights): multi-byte tail, EOS, length cut, padding ids
 tok = Tokenizer("models/qwen2.5-0.5b/tokenizer.json")
+class FakeState:
+    def __init__(self): self.length = 0
 class Scripted:
-    """forward() returns logits that force the next token of a script (then EOS)."""
+    """Follows the model protocol (new_state / forward with a state) and forces a scripted token sequence."""
     def __init__(self, script, vocab=151936, pad_bias=False):
         self.script, self.vocab, self.pad_bias = script, vocab, pad_bias
-    def forward(self, ids):
-        step = len(ids) - self.start
-        out = torch.full((len(ids), self.vocab), -1e9)
+    def new_state(self, max_len): return FakeState()
+    def forward(self, ids, state=None, last_only=False):
+        state.length += len(ids)
+        step = state.length - self.start
+        out = torch.full((1, self.vocab), -1e9)
         nxt = self.script[step] if step < len(self.script) else 151645
-        out[-1, nxt] = 10.0
+        out[0, nxt] = 10.0
         if self.pad_bias:
-            out[-1, 151900] = 50.0          # a padding row scoring far higher than any real token
+            out[0, 151900] = 50.0          # a padding row scoring far higher than any real token
         return out
 def run(script, max_new, pad_bias=False):
     m = Scripted(script, pad_bias=pad_bias); prompt = tok.encode("hi"); m.start = len(prompt)

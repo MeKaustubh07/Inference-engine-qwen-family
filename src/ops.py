@@ -27,8 +27,8 @@ def rope(x: torch.Tensor, positions: torch.Tensor, theta: float) -> torch.Tensor
     d = x.shape[-1]
     half = d // 2
     # One rotation speed per pair: fast for the first pairs, very slow for the last.
-    freqs = 1.0 / (theta ** (torch.arange(0, half, dtype=torch.float32) / half))  # [d/2]
-    angles = positions.float()[:, None] * freqs[None, :]                          # [T, d/2]
+    freqs = 1.0 / (theta ** (torch.arange(0, half, dtype=torch.float32, device=x.device) / half))  # [d/2]
+    angles = positions.to(x.device).float()[:, None] * freqs[None, :]                          # [T, d/2]
     cos = torch.cos(angles)[:, None, :]                                           # [T, 1, d/2]
     sin = torch.sin(angles)[:, None, :]                                           # broadcast over heads
 
@@ -64,7 +64,7 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, causal: bool = 
 
     if causal:
         # query i sits at absolute position S - T + i and may only see keys at positions <= that
-        future = torch.ones(T, S, dtype=torch.bool).triu(diagonal=S - T + 1)
+        future = torch.ones(T, S, dtype=torch.bool, device=q.device).triu(diagonal=S - T + 1)
         scores = scores.masked_fill(future, float("-inf"))   # exp(-inf) = 0 -> zero weight
 
     weights = softmax(scores, dim=-1)                   # [Hq, T, S]: each row sums to 1
