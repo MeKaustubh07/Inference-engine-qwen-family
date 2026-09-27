@@ -16,9 +16,11 @@ class TorchBackend:
     def prepare(self, w: torch.Tensor) -> torch.Tensor:
         return w.to(device=self.device, dtype=self.weight_dtype)
 
-    def linear(self, x, w, b=None):
+    def linear(self, x, w, b=None, residual=None):
         y = (x.to(w.dtype) @ w.T).float()
-        return y + b.float() if b is not None else y
+        if b is not None:
+            y = y + b.float()
+        return y + residual if residual is not None else y
 
     def rms_norm(self, x, w, eps):
         return ops.rms_norm(x, w, eps)
@@ -31,6 +33,11 @@ class TorchBackend:
 
     def silu_mul(self, gate, up):
         return ops.silu_mul(gate, up)
+
+    def swiglu(self, x, w_gate_up):
+        y = self.linear(x, w_gate_up)
+        F = w_gate_up.shape[0] // 2
+        return self.silu_mul(y[:, :F], y[:, F:])
 
     def sync(self) -> None:
         """Wait for queued GPU work (needed for honest timing on MPS)."""

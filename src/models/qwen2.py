@@ -21,6 +21,12 @@ class Qwen2Model:
             self._cache[name] = self.b.prepare(self.weights.get(name))
         return self._cache[name]
 
+    def _fused(self, key: str, names: list[str]) -> torch.Tensor:
+        """Stack several weights row-wise into one resident tensor (e.g. q/k/v -> one projection)."""
+        if key not in self._cache:
+            self._cache[key] = self.b.prepare(torch.cat([self.weights.get(n) for n in names], dim=0))
+        return self._cache[key]
+
     def new_state(self, max_len: int) -> ContiguousKVCache:
         cfg = self.config
         return ContiguousKVCache(cfg.num_hidden_layers, cfg.num_key_value_heads, cfg.head_dim, max_len,
@@ -32,59 +38,72 @@ class Qwen2Model:
                            device=self.b.device, dtype=torch.float32)
 
     def embed(self, ids: torch.Tensor) -> torch.Tensor:
-        """Token ids [T] -> vectors [T, hidden]: row lookup in the embedding table."""
-        return self.embed_table[ids.cpu()].float().to(self.b.device)
+        """Token ids [T] -> vectors [T, hidden]: row lookup in the embedding table.
+
+        The lookup runs where the table lives. On the GPU backends that is the resident (tied) table, so
+        no row is copied from the CPU (a CPU->GPU copy would wait for all queued GPU work)."""
+        if self.b.device.type == "cpu":
+            return self.embed_table[ids].float()
+        table = self._w("model.embed_tokens.weight")
+        return table[ids.to(self.b.device, non_blocking=True)].float()
 
     def self_attn(self, layer: int, x: torch.Tensor, positions: torch.Tensor | None = None,
-                  state: ContiguousKVCache | None = None) -> torch.Tensor:
+                  state: ContiguousKVCache | None = None, residual: torch.Tensor | None = None,
+                  start: int | None = None) -> torch.Tensor:
         """Attention half of one station. x: normalized stream [T, hidden] -> [T, hidden].
 
         positions: absolute positions of the T tokens (default 0..T-1).
         state:     KV cache; the new keys/values are written at `positions` and attention reads
                    every cached position up to the last new one.
+        residual:  if given, added inside the output projection (fused residual connection).
+        start:     first position as a plain int. Pass it whenever you can: reading it back from a GPU
+                   tensor (int(positions[0])) forces the CPU to wait for all queued GPU work.
         """
         cfg, b = self.config, self.b
         p = f"model.layers.{layer}.self_attn."
         T = x.shape[0]
+        Hq, Hkv, d = cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim
         if positions is None:
             positions = torch.arange(T, device=b.device)
 
-        # 1. Projections (Qwen adds biases to q, k and v)
-        q = b.linear(x, self._w(p + "q_proj.weight"), self._w(p + "q_proj.bias"))   # [T, 896]
-        k = b.linear(x, self._w(p + "k_proj.weight"), self._w(p + "k_proj.bias"))   # [T, 128]
-        v = b.linear(x, self._w(p + "v_proj.weight"), self._w(p + "v_proj.bias"))   # [T, 128]
+        # 1. One fused projection for q, k and v (Qwen adds biases to all three)
+        names = ["q_proj", "k_proj", "v_proj"]
+        qkv = b.linear(x, self._fused(p + "qkv.weight", [p + n + ".weight" for n in names]),
+                       self._fused(p + "qkv.bias", [p + n + ".bias" for n in names]))       # [T, 896+128+128]
 
         # 2. Split into heads
-        q = q.view(T, cfg.num_attention_heads, cfg.head_dim)
-        k = k.view(T, cfg.num_key_value_heads, cfg.head_dim)
-        v = v.view(T, cfg.num_key_value_heads, cfg.head_dim)
+        q = qkv[:, : Hq * d].reshape(T, Hq, d)
+        k = qkv[:, Hq * d : (Hq + Hkv) * d].reshape(T, Hkv, d)
+        v = qkv[:, (Hq + Hkv) * d :].reshape(T, Hkv, d)
 
-        # 3. Rotate queries and keys by position
-        q = b.rope(q, positions, cfg.rope_theta)
-        k = b.rope(k, positions, cfg.rope_theta)
+        # 3. Rotate queries and keys by position in one call (RoPE is independent per head)
+        qk = b.rope(torch.cat([q, k], dim=1), positions, cfg.rope_theta)
+        q, k = qk[:, :Hq], qk[:, Hq:]
 
         # 4. KV cache: store the new keys/values, then attend over everything cached so far
         if state is not None:
-            start = int(positions[0])
+            if start is None:
+                start = int(positions[0])                          # host sync; forward() passes start instead
             state.write(layer, start, k, v)
             k, v = state.read(layer, start + T)
 
         out = b.attention(q, k, v, causal=True)                   # [T, 14, 64]
-        return b.linear(out.reshape(T, -1), self._w(p + "o_proj.weight"))   # no bias on o_proj
+        return b.linear(out.reshape(T, -1), self._w(p + "o_proj.weight"), residual=residual)   # no bias
 
-    def mlp(self, layer: int, x: torch.Tensor) -> torch.Tensor:
+    def mlp(self, layer: int, x: torch.Tensor, residual: torch.Tensor | None = None) -> torch.Tensor:
         """Feed-forward half of one station (SwiGLU). x: normalized stream [T, hidden] -> [T, hidden]."""
         b, p = self.b, f"model.layers.{layer}.mlp."
-        gate = b.linear(x, self._w(p + "gate_proj.weight"))      # [T, 4864]
-        up = b.linear(x, self._w(p + "up_proj.weight"))          # [T, 4864]
-        return b.linear(b.silu_mul(gate, up), self._w(p + "down_proj.weight"))
+        w_gate_up = self._fused(p + "gate_up.weight", [p + "gate_proj.weight", p + "up_proj.weight"])  # [2*4864, 896]
+        hidden = b.swiglu(x, w_gate_up)                           # silu(x @ gate.T) * (x @ up.T), [T, 4864]
+        return b.linear(hidden, self._w(p + "down_proj.weight"), residual=residual)
 
     def block(self, layer: int, h: torch.Tensor, positions: torch.Tensor | None = None,
-              state: ContiguousKVCache | None = None) -> torch.Tensor:
+              state: ContiguousKVCache | None = None, start: int | None = None) -> torch.Tensor:
         """One full station: pre-norm attention and pre-norm MLP, each added back into the residual stream."""
         eps, b, p = self.config.rms_norm_eps, self.b, f"model.layers.{layer}."
-        h = h + self.self_attn(layer, b.rms_norm(h, self._w(p + "input_layernorm.weight"), eps), positions, state)
-        h = h + self.mlp(layer, b.rms_norm(h, self._w(p + "post_attention_layernorm.weight"), eps))
+        h = self.self_attn(layer, b.rms_norm(h, self._w(p + "input_layernorm.weight"), eps), positions, state,
+                           residual=h, start=start)
+        h = self.mlp(layer, b.rms_norm(h, self._w(p + "post_attention_layernorm.weight"), eps), residual=h)
         return h
 
     def forward(self, ids: torch.Tensor, state: ContiguousKVCache | None = None,
@@ -95,10 +114,10 @@ class Qwen2Model:
         With a state, the tokens continue from state.length and their keys/values are cached.
         """
         start = state.length if state is not None else 0
-        positions = torch.arange(start, start + len(ids), device=self.b.device)
+        positions = torch.arange(start, start + len(ids), device=self.b.device, dtype=torch.int32)
         h = self.embed(ids)
         for layer in range(self.config.num_hidden_layers):
-            h = self.block(layer, h, positions, state)
+            h = self.block(layer, h, positions, state, start)
         if state is not None:
             state.advance(len(ids))
         if last_only:

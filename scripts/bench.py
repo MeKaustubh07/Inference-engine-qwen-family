@@ -1,6 +1,6 @@
 """Benchmark harness: TTFT, TPOT, prefill/decode throughput, peak memory, and the bandwidth ceiling.
 
-usage: bench.py --backend cpu|mps [--prompt-lens 16,256,1024] [--new 32] [--no-cache] [--out docs/bench/x.md]
+usage: bench.py --backend cpu|mps|metal [--prompt-lens 16,256,1024] [--new 32] [--no-cache] [--out docs/bench/x.md]
 """
 import argparse
 import resource
@@ -10,6 +10,7 @@ import time
 import torch
 
 sys.path.insert(0, "src")
+from backend.metal import MetalBackend
 from backend.torch_ref import TorchBackend
 from config import ModelConfig
 from models.qwen2 import Qwen2Model
@@ -63,14 +64,15 @@ def bench_one(model, ids: list[int], new: int, use_cache: bool, sync) -> dict:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--backend", choices=["cpu", "mps"], default="cpu")
+    ap.add_argument("--backend", choices=["cpu", "mps", "metal"], default="cpu")
     ap.add_argument("--prompt-lens", default="16,256,1024")
     ap.add_argument("--new", type=int, default=32)
     ap.add_argument("--no-cache", action="store_true", help="also measure recompute-everything decoding")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
 
-    backend = TorchBackend("cpu", torch.float32) if a.backend == "cpu" else TorchBackend("mps", torch.bfloat16)
+    backend = {"cpu": lambda: TorchBackend("cpu", torch.float32), "mps": lambda: TorchBackend("mps", torch.bfloat16),
+               "metal": MetalBackend}[a.backend]()
     cfg = ModelConfig.from_json(f"{D}/config.json")
     model = Qwen2Model(cfg, SafetensorsFile(f"{D}/model.safetensors"), backend)
     tok = Tokenizer(f"{D}/tokenizer.json")

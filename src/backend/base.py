@@ -15,8 +15,9 @@ class Backend(Protocol):
     def prepare(self, w: torch.Tensor) -> torch.Tensor:
         """Move/convert one weight tensor into this backend's resident format (called once per weight)."""
 
-    def linear(self, x: torch.Tensor, w: torch.Tensor, b: torch.Tensor | None = None) -> torch.Tensor:
-        """x [T, K] @ w[N, K].T (+ b) -> [T, N] in fp32. T == 1 is the decode matvec."""
+    def linear(self, x: torch.Tensor, w: torch.Tensor, b: torch.Tensor | None = None,
+               residual: torch.Tensor | None = None) -> torch.Tensor:
+        """x [T, K] @ w[N, K].T (+ b) (+ residual) -> [T, N] in fp32. T == 1 is the decode matvec."""
 
     def rms_norm(self, x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
         """[..., D] -> [..., D]"""
@@ -29,3 +30,6 @@ class Backend(Protocol):
 
     def silu_mul(self, gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
         """silu(gate) * up"""
+
+    def swiglu(self, x: torch.Tensor, w_gate_up: torch.Tensor) -> torch.Tensor:
+        """w_gate_up = [gate; up] stacked [2F, K]: returns silu(x @ gate.T) * (x @ up.T), [T, F]."""
