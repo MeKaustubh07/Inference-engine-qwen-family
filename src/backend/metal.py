@@ -14,7 +14,7 @@ KERNEL_DIR = Path(__file__).resolve().parent.parent / "kernels"
 TG = 256                                                   # threads per threadgroup for row-parallel kernels
 MAX_BATCH = 8                                              # rows one batched matvec dispatch handles (MAX_BATCH in MSL)
 KERNEL_ROWS = 4 * MAX_BATCH                                # up to here: batched kernels in groups; beyond: GEMM
-DEQUANT_CHUNK = 1 << 23                                    # weights dequantized per prefill GEMM piece (32 MB fp32)
+DEQUANT_CHUNK = 1 << 24                                    # weights expanded per prefill GEMM piece (32 MB bf16)
 
 
 def load_library():
@@ -59,14 +59,14 @@ class MetalBackend(TorchBackend):
         N, K = w.shape
         if MAX_BATCH < M <= KERNEL_ROWS:
             return self._groups(self._qlinear, x, w, b, residual)
-        if M > KERNEL_ROWS:                                # prefill: dequantize on the GPU, tuned GEMM
-            # in row chunks: dequantizing the whole matrix at once would need several GB of fp32 temporaries
-            # for the 248k-row tied head
-            x, step = x.float(), max(1, DEQUANT_CHUNK // K)
+        if M > KERNEL_ROWS:                                # prefill: expand to bf16 on the GPU, tuned bf16 GEMM
+            # in row chunks, so the 248k-row tied head never needs a full-size temporary; same precision as the
+            # bf16 backend's prefill (bf16 operands, fp32 accumulation)
+            x16, step = x.to(torch.bfloat16), max(1, DEQUANT_CHUNK // K)
             y = torch.empty(M, N, device=self.device)
             for r in range(0, N, step):
                 rows = slice(r, min(N, r + step))
-                y[:, rows] = x @ w.dequantize(rows).T
+                y[:, rows] = (x16 @ self._dequant_bf16(w, rows).T).float()
             if b is not None:
                 y = y + b.float()
             return y + residual if residual is not None else y
@@ -86,6 +86,19 @@ class MetalBackend(TorchBackend):
             else:
                 self.lib.matvec_q4_rows(*args, w.mins, M, threads=g, group_size=TG)
         return y
+
+    def _dequant_bf16(self, w: QuantTensor, rows: slice) -> torch.Tensor:
+        """Rows of a quantized matrix as bf16 [rows, K], one kernel pass."""
+        K = w.shape[1]
+        n_rows = rows.stop - rows.start
+        out = torch.empty(n_rows, K, dtype=torch.bfloat16, device=self.device)
+        if w.scheme == "int4":
+            n = n_rows * K // 8
+            self.lib.dequant_q4_bf16(out, w.data[rows], w.scales[rows], w.mins[rows], K, n, threads=n, group_size=TG)
+        else:
+            n = n_rows * K // 4
+            self.lib.dequant_q8_bf16(out, w.data[rows], w.scales[rows], K, n, threads=n, group_size=TG)
+        return out
 
     def linear(self, x, w, b=None, residual=None):
         if isinstance(w, QuantTensor):

@@ -119,3 +119,35 @@ kernel void matvec_q8_rows(device float* y [[buffer(0)]], device const char4* W 
     }
     ROWS_EPILOGUE
 }
+
+// Prefill: expand quantized weights to bf16 in one pass (read packed blocks, write bf16), feeding the tuned bf16
+// GEMM. One thread per 8 (INT4) or 4 (INT8) weights; W/scales/mins are the rows of one chunk, row-major.
+kernel void dequant_q4_bf16(device bfloat* out          [[buffer(0)]],
+                            device const uchar4* W      [[buffer(1)]],
+                            device const half* scales   [[buffer(2)]],
+                            device const half* mins     [[buffer(3)]],
+                            constant uint& K            [[buffer(4)]],
+                            constant uint& n            [[buffer(5)]],    // uchar4 groups in the chunk
+                            uint gid [[thread_position_in_grid]]) {
+    if (gid >= n) return;
+    uint row = gid / (K / 8), j = gid - row * (K / 8);
+    uchar4 p = W[gid];
+    float s = float(scales[row * (K / 32) + j / 4]), mn = float(mins[row * (K / 32) + j / 4]);
+    float4 lo = float4(p & 0x0F) * s + mn, hi = float4(p >> 4) * s + mn;
+    device bfloat* o = out + (ulong)gid * 8;                     // low nibble = even element, high = odd
+    o[0] = bfloat(lo.x); o[1] = bfloat(hi.x); o[2] = bfloat(lo.y); o[3] = bfloat(hi.y);
+    o[4] = bfloat(lo.z); o[5] = bfloat(hi.z); o[6] = bfloat(lo.w); o[7] = bfloat(hi.w);
+}
+
+kernel void dequant_q8_bf16(device bfloat* out          [[buffer(0)]],
+                            device const char4* W       [[buffer(1)]],
+                            device const half* scales   [[buffer(2)]],
+                            constant uint& K            [[buffer(3)]],
+                            constant uint& n            [[buffer(4)]],    // char4 groups in the chunk
+                            uint gid [[thread_position_in_grid]]) {
+    if (gid >= n) return;
+    uint row = gid / (K / 4), j = gid - row * (K / 4);
+    float4 w = float4(W[gid]) * float(scales[row * (K / 32) + j / 8]);
+    device bfloat* o = out + (ulong)gid * 4;
+    o[0] = bfloat(w.x); o[1] = bfloat(w.y); o[2] = bfloat(w.z); o[3] = bfloat(w.w);
+}
