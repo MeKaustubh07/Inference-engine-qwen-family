@@ -189,6 +189,7 @@ class HybridState:
         if self.pool is not None:
             self.pool.release(self.seq)
             self.pool = None
+            self.S = self.conv_tail = None                    # the slot may now belong to another sequence
         elif self.seq is None:
             self.S.zero_()
             self.conv_tail.zero_()

@@ -91,8 +91,8 @@ class MetalBackend(TorchBackend):
         if isinstance(w, QuantTensor):
             return self._qlinear(x, w, b, residual)
         M = x.shape[0]
-        if M > KERNEL_ROWS or w.dtype != torch.bfloat16:
-            return super().linear(x, w, b, residual)       # prefill: tuned GEMM
+        if M > KERNEL_ROWS or w.dtype != torch.bfloat16 or (M > 1 and w.shape[1] % 4):
+            return super().linear(x, w, b, residual)       # prefill (or K the batched kernel can't vectorize): GEMM
         if M > MAX_BATCH:
             return self._groups(self.linear, x, w, b, residual)
         N, K = w.shape

@@ -48,6 +48,8 @@ class Request:
 class Scheduler:
     def __init__(self, engine, metrics, max_batch: int = 8, max_waiting: int = 64, kv_blocks: int = 1024,
                  block_size: int = 16, max_model_len: int = 4096):
+        if not 1 <= max_batch <= 32:                          # batched decode kernels cover up to 32 rows
+            raise ValueError("max_batch must be between 1 and 32")
         self.eng, self.metrics = engine, metrics
         self.model, self.tok = engine.model, engine.tokenizer
         self.max_batch, self.max_waiting, self.max_model_len = max_batch, max_waiting, max_model_len
@@ -162,6 +164,8 @@ class Scheduler:
                 # next step; otherwise the newcomer would be preempted right away and its prefill wasted
                 if self._blocks_for(len(ids) + 1) + len(self.running) > self.pool.allocator.num_free:
                     return                                    # wait for running requests to free blocks
+                if not getattr(self.pool, "free_seqs", True):
+                    return                                    # hybrid models: wait for a DeltaNet state slot too
                 self.waiting.popleft()
             try:
                 req.state = self.model.new_paged_state(self.pool)

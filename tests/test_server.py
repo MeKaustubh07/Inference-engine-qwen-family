@@ -17,6 +17,8 @@ from engine import load_engine
 from quant import quantize
 from sampler import SamplingParams
 from server.app import OutputFilter, create_app
+from server.metrics import Metrics
+from server.scheduler import Scheduler
 from server.scheduler import QueueFull
 
 results = []
@@ -345,13 +347,13 @@ from backend.metal import MetalBackend
 mb = MetalBackend("int4")
 torch.manual_seed(0)
 for scheme in ["bf16", "int8", "int4"]:
-    w0 = torch.randn(384, 1024, dtype=torch.bfloat16) * 0.05
+    w0 = torch.randn(383, 1056, dtype=torch.bfloat16) * 0.05  # odd N (last SIMD group has one row), K % 128 != 0
     w = w0.to("mps") if scheme == "bf16" else quantize(w0, scheme).to("mps")
     dense_w = w.float() if scheme == "bf16" else w.dequantize().float()
-    bias = torch.randn(384, dtype=torch.bfloat16, device="mps")
+    bias = torch.randn(383, dtype=torch.bfloat16, device="mps")
     worst = 0.0
     for M in [2, 3, 8, 13, 32]:                              # 13 and 32 run as groups of 8
-        x, res = torch.randn(M, 1024, device="mps"), torch.randn(M, 384, device="mps")
+        x, res = torch.randn(M, 1056, device="mps"), torch.randn(M, 383, device="mps")
         for bb, rr in [(None, None), (bias, None), (None, res), (bias, res)]:
             yb = mb.linear(x, w, bb, rr)
             rows = torch.cat([mb.linear(x[i:i + 1], w, bb, None if rr is None else rr[i:i + 1]) for i in range(M)])
@@ -361,8 +363,8 @@ for scheme in ["bf16", "int8", "int4"]:
           f"(worst {worst:.1e})", worst < 1e-3)
 
 for name, backend in [("qwen3.5-0.8b", "metal"), ("qwen3.5-0.8b", "metal-int4"), ("qwen2.5-0.5b", "metal")]:
-    # batched decode (pooled DeltaNet state, paged attention, batched matvec kernels) uses the same fp32 math as
-    # single-sequence decode, so a request's output must not depend on how many others share its batch
+    # batched decode (pooled DeltaNet state, paged attention, batched matvec kernels) must give each request the
+    # same output as decoding it alone: bit-identical for bf16; INT4 dequantizes in a different order (rounding)
     eng = load_engine(name, backend)
     V, N = eng.tokenizer.vocab_size(), 12
     ids = [eng.tokenizer.encode(p) for p in PROMPTS]
@@ -371,6 +373,23 @@ for name, backend in [("qwen3.5-0.8b", "metal"), ("qwen3.5-0.8b", "metal-int4"),
     worst = max((a - b).abs().max().item() for j in range(4) for a, b in zip(logs[j], ref[j][1]))
     check(f"{name} {backend}: decode_batch (B up to 4, one joins late) greedy == single-sequence greedy, "
           f"max|dlogit| {worst:.1e} < 1e-2", all(got[j] == ref[j][0] for j in range(4)) and worst < 1e-2)
+    if name == "qwen3.5-0.8b" and backend == "metal-int4":
+        # the scheduler over a HybridPool, with a KV pool small enough to force preemption: every request still
+        # matches decoding it alone, and every KV block and DeltaNet state slot comes back
+        sched = Scheduler(eng, Metrics(), max_batch=3, kv_blocks=7, max_model_len=96)
+        reqs = [sched.submit(x, GREEDY, 30) for x in ids[:3]]
+        texts = []
+        for r in reqs:
+            while (item := r.out.get(timeout=300))[0] == "token":
+                pass
+            texts.append(eng.tokenizer.decode(r.generated))
+        want = [eng.tokenizer.decode(sequential(eng.model, V, x, 30, set(eng.eos_ids))[0]) for x in ids[:3]]
+        c_ = sched.metrics.counters
+        check(f"scheduler over a HybridPool on Metal INT4: {c_['requests_preempted_total']} preemptions, outputs == "
+              f"decoding alone, all KV blocks and state slots returned",
+              c_["requests_preempted_total"] >= 1 and texts == want and sched.pool.allocator.num_free == 7
+              and len(sched.pool.free_seqs) == 3)
+        sched.shutdown(5)
     del eng
     gc.collect(); torch.mps.empty_cache()
 

@@ -69,8 +69,11 @@ except OutOfBlocks:
     raised = True
 check("KV exhaustion raises before any layer runs: recurrent and conv state unchanged, length unchanged",
       raised and torch.equal(st.S, S_before) and torch.equal(st.conv_tail, tail_before) and st.length == 6)
+pool, seq = st.pool, st.seq
 st.free()
-check("free() returns blocks and zeroes the recurrent/conv state", st.S.abs().sum() == 0 and st.conv_tail.abs().sum() == 0)
+check("free() returns the KV blocks and the state slot, zeroed, and detaches the state from it",
+      pool.allocator.num_free == 2 and seq in pool.free_seqs and pool.S[seq].abs().sum() == 0
+      and pool.conv[seq].abs().sum() == 0 and st.S is None)
 
 # special tokens declared only in tokenizer_config.json (audio/TTS markers) are single ids, as in HF
 check("tokenizer: '<|audio_start|>' -> [248070], '<tts_pad>' -> [248072], decode round-trips",

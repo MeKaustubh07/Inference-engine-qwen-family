@@ -36,8 +36,8 @@ constant uint MAX_BATCH = 8;                          // also used by qmatvec.me
 // Decode matvec for M <= 8 activation rows, R = 2 output rows per SIMD group. For each step a lane dequantizes
 // its 8 weights of all R rows once, then loads each x value once and uses it for all R rows: x is read R times
 // less often than with one row per SIMD group (with M = 8, x traffic, not weight traffic, was the bottleneck).
-// Loops over M and R are fully unrolled with guards, so accumulators stay in registers. Used for M >= 4, where
-// it beat the one-row batched kernels (measured: 2 rows > 4 rows > 1 row per SIMD group at M = 4..8).
+// Loops over M and R are fully unrolled with guards, so accumulators stay in registers. Used for every M >= 2
+// (measured on Qwen3.5-2B shapes: 2 rows beat 4 rows and 1 row per SIMD group from M = 2 to 8). K % 4 == 0.
 constant uint RR = 2;                           // output rows per SIMD group
 
 #define ROWS_EPILOGUE                                                                             \
