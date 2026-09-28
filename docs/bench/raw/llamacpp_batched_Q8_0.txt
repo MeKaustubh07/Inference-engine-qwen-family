@@ -1,0 +1,25 @@
+0.00.348.844 W model has unused tensor blk.24.attn_norm.weight (size = 8192 bytes) -- ignoring
+0.00.348.850 W model has unused tensor blk.24.post_attention_norm.weight (size = 8192 bytes) -- ignoring
+0.00.348.857 W model has unused tensor blk.24.attn_q.weight (size = 8912896 bytes) -- ignoring
+0.00.348.859 W model has unused tensor blk.24.attn_k.weight (size = 1114112 bytes) -- ignoring
+0.00.348.862 W model has unused tensor blk.24.attn_v.weight (size = 1114112 bytes) -- ignoring
+0.00.348.869 W model has unused tensor blk.24.attn_output.weight (size = 4456448 bytes) -- ignoring
+0.00.348.871 W model has unused tensor blk.24.attn_q_norm.weight (size = 1024 bytes) -- ignoring
+0.00.348.873 W model has unused tensor blk.24.attn_k_norm.weight (size = 1024 bytes) -- ignoring
+0.00.348.875 W model has unused tensor blk.24.ffn_gate.weight (size = 13369344 bytes) -- ignoring
+0.00.348.877 W model has unused tensor blk.24.ffn_down.weight (size = 13369344 bytes) -- ignoring
+0.00.348.879 W model has unused tensor blk.24.ffn_up.weight (size = 13369344 bytes) -- ignoring
+0.00.348.882 W model has unused tensor blk.24.nextn.eh_proj.weight (size = 8912896 bytes) -- ignoring
+0.00.348.885 W model has unused tensor blk.24.nextn.enorm.weight (size = 8192 bytes) -- ignoring
+0.00.348.887 W model has unused tensor blk.24.nextn.hnorm.weight (size = 8192 bytes) -- ignoring
+0.00.348.894 W model has unused tensor blk.24.nextn.shared_head_norm.weight (size = 8192 bytes) -- ignoring
+
+llama_batched_bench: n_kv_max = 2048, n_batch = 2048, n_ubatch = 512, flash_attn = -1, is_pp_shared = 0, is_tg_separate = 0, n_gpu_layers = 99, n_threads = 4, n_threads_batch = 4
+
+|    PP |     TG |    B |   N_KV |   T_PP s | S_PP t/s |   T_TG s | S_TG t/s |      T s |    S t/s |
+|-------|--------|------|--------|----------|----------|----------|----------|----------|----------|
+|    16 |     32 |    1 |     48 |    0.060 |   265.45 |    0.828 |    38.64 |    0.888 |    54.03 |
+|    16 |     32 |    2 |     96 |    0.136 |   235.12 |    1.113 |    57.50 |    1.249 |    76.85 |
+|    16 |     32 |    4 |    192 |    0.204 |   314.39 |    1.938 |    66.04 |    2.142 |    89.64 |
+|    16 |     32 |    8 |    384 |    0.370 |   345.92 |    3.874 |    66.09 |    4.244 |    90.49 |
+

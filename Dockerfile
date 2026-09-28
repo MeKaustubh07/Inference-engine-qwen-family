@@ -23,6 +23,6 @@ HEALTHCHECK --interval=15s --timeout=3s --start-period=120s \
 # weights are mounted at /app/models (not baked in: the image stays small and models can change without a rebuild)
 ENTRYPOINT ["python", "scripts/serve.py", "--host", "0.0.0.0", "--port", "8000"]
 # Default fits Docker Desktop's standard 4 GB VM (measured: ready in ~12 s, 2.4 GB, ~4 tok/s decode on 8 vCPUs).
-# Qwen3.5-0.8B in fp32 peaks at ~3.5 GB: in a 4 GB VM it pages (6 tokens took 114 s); give the VM >= 6 GB, then
+# Qwen3.5-0.8B in fp32 peaks at ~3.5 GB: in a 4 GB VM it pages (6 tokens took 114 s); give the VM more (>= 6 GB suggested, untested), then
 # pass --model qwen3.5-0.8b. The GPU path (Metal, INT4 2B) is scripts/serve.py run natively on macOS.
 CMD ["--model", "qwen2.5-0.5b", "--backend", "cpu", "--kv-blocks", "256", "--max-batch", "4"]

@@ -1,0 +1,4 @@
+      bf16 : weights 3.76 GB | greedy = HF for 64/70 tokens | top-1 flips 0/190 non-tied positions | KL vs HF bf16 0.0004 | decode 18.7 tok/s | ' Paris.\nA. True' | divergence gaps [0.015]
+      int8 : weights 2.00 GB | greedy = HF for 70/70 tokens | top-1 flips 0/190 non-tied positions | KL vs HF bf16 0.0007 | decode 35.6 tok/s | ' Paris.\nA. True' | divergence gaps []
+      int4 : weights 1.41 GB | greedy = HF for 47/70 tokens | top-1 flips 3/190 non-tied positions | KL vs HF bf16 0.0454 | decode 46.5 tok/s | ' Paris. The capital of the' | divergence gaps [0.063, 0.042, 0.105]
+6/6 checks passed

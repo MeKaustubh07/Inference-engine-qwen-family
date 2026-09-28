@@ -1,0 +1,15 @@
+PASS  allocator hands out 4 distinct blocks
+PASS  allocator raises OutOfBlocks when empty
+PASS  freed blocks are reusable
+PASS  prompt 0 (5 tokens, table [7, 2]): paged == contiguous, max|diff|=0.0e+00, exactly ceil(len/4) blocks
+PASS  prompt 1 (2 tokens, table [7]): paged == contiguous, max|diff|=0.0e+00, exactly ceil(len/4) blocks
+PASS  prompt 2 (4 tokens, table [7]): paged == contiguous, max|diff|=0.0e+00, exactly ceil(len/4) blocks
+PASS  prompt 3 (10 tokens, table [7, 2, 9]): paged == contiguous, max|diff|=0.0e+00, exactly ceil(len/4) blocks
+PASS  prompt 4 (11 tokens, table [7, 2, 9]): paged == contiguous, max|diff|=0.0e+00, exactly ceil(len/4) blocks
+PASS  all blocks returned to the pool after freeing
+PASS  OutOfBlocks raised before taking anything (failed request holds 0 blocks, 3 still free)
+PASS  the other sequence can still decode after the failure
+PASS  interleaved sequences match their solo runs (diff 0.0e+00, 0.0e+00), no shared blocks
+PASS  paged bytes for 10 tokens = 294912 (= 3 blocks x 4 tokens x 24576 B)
+
+13/13 checks passed

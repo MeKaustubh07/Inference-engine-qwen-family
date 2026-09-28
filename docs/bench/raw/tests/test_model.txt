@@ -1,0 +1,11 @@
+0: tokens= 5  logits max|diff|=9.54e-05 (values up to 19.3)  top-1 agreement=100%  PASS
+1: tokens= 2  logits max|diff|=8.46e-05 (values up to 16.5)  top-1 agreement=100%  PASS
+2: tokens= 4  logits max|diff|=7.41e-05 (values up to 21.1)  top-1 agreement=100%  PASS
+3: tokens=10  logits max|diff|=2.97e-04 (values up to 21.8)  top-1 agreement=100%  PASS
+4: tokens=11  logits max|diff|=1.87e-04 (values up to 19.6)  top-1 agreement=100%  PASS
+greedy 0: 'The capital of France is' -> ' Paris. It is the largest city in Europe and'  PASS
+greedy 1: 'Hello world' -> "! I'm trying to create a program that can"  PASS
+greedy 2: 'def fibonacci(n):' -> ' \n    if n <= 1: \n       '  PASS
+greedy 3: 'The quick brown fox jumps over the lazy dog.' -> ' How many times does the word "fox" appear'  PASS
+greedy 4: 'Kaustubh builds an inference engine in Python.' -> ' He has a dataset of 1000'  PASS
+greedy decoding for 5 prompts x 10 tokens took 3.9s

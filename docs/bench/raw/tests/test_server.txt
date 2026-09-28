@@ -1,0 +1,47 @@
+PASS  qwen3.5-0.8b: batched greedy == sequential for 3 prompts (one joins at step 3)
+PASS  qwen3.5-0.8b: batched logits == sequential logits (max|diff| 4.0e-05 < 2e-3)
+PASS  qwen3.5-0.8b: every KV block returned to the pool after sequences leave
+PASS  qwen2.5-0.5b: batched greedy == sequential for 3 prompts (one joins at step 3)
+PASS  qwen2.5-0.5b: batched logits == sequential logits (max|diff| 5.8e-05 < 2e-3)
+PASS  qwen2.5-0.5b: every KV block returned to the pool after sequences leave
+PASS  thinking mode: text before </think> is reasoning, after it content
+PASS  newlines after </think> are dropped even when they arrive in later pieces
+PASS  thinking mode cut off by max_tokens: everything is reasoning, no content
+PASS  stop string split across pieces: content cut before it, nothing after
+PASS  held-back tail that never becomes a stop string is flushed
+PASS  /health and /ready return 200
+PASS  4 concurrent completions (continuous batching) == sequential greedy text
+PASS  they really shared decode steps (mean decode batch 2.80 > 1.5)
+PASS  usage counts prompt and completion tokens
+PASS  finish_reason is 'length' at max_tokens
+PASS  SSE stream: text/event-stream, chunks concatenate to the non-stream text, ends with [DONE]
+PASS  chat completion == sequential greedy on the chat-formatted prompt; role assistant
+PASS  chat SSE: first delta carries role 'assistant'; deltas concatenate to the non-stream message
+PASS  Hindi (multi-byte) stream == non-stream == sequential, no U+FFFD: ' यह एक विशेष रू'
+PASS  stop string ' if': text cut before it, finish_reason 'stop', same when streaming
+PASS  max_completion_tokens is honoured
+PASS  temperature 1e-40 behaves as greedy and does not break the request batched with it
+PASS  invalid parameters (incl. n > 1) -> 422
+PASS  system message not first / no user message -> 400; lone surrogate -> 422, not a crash ([400, 400, 422])
+PASS  prompt + max_tokens over max_model_len -> 400
+PASS  same seed -> same sampled text, even when the two requests are batched together
+PASS  /metrics exposes counters, gauges and latency histograms
+PASS  cancel stops generation early and frees its KV blocks
+PASS  graceful shutdown drains the in-flight request, then refuses new ones and reports not-ready
+PASS  bounded queue: over-capacity requests get 429 + Retry-After (codes [200, 200, 429, 429, 429, 429])
+PASS  rejections are counted in metrics
+PASS  cancelling a queued request frees its queue slot at once (no 429 for the next client)
+PASS  KV pool exhaustion preempts (1 preemptions) and recomputes: outputs still == sequential greedy
+PASS  all KV blocks free after preempted requests finish
+PASS  real uvicorn: SSE chunks arrive as they are generated (first 0.20s, last 1.29s)
+PASS  real uvicorn: a non-streaming request whose client gave up is cancelled (43 of 400 tokens made), blocks freed
+PASS  real uvicorn: shutdown runs the lifespan (engine thread stopped, not ready)
+PASS  batched bf16 matvec (M=2,3,8,13,32; with/without bias and residual) == per-row kernel == dense (worst 5.7e-06)
+PASS  batched int8 matvec (M=2,3,8,13,32; with/without bias and residual) == per-row kernel == dense (worst 9.1e-06)
+PASS  batched int4 matvec (M=2,3,8,13,32; with/without bias and residual) == per-row kernel == dense (worst 6.4e-06)
+PASS  qwen3.5-0.8b metal: decode_batch (B up to 4, one joins late) greedy == single-sequence greedy, max|dlogit| 0.0e+00 < 1e-2
+PASS  qwen3.5-0.8b metal-int4: decode_batch (B up to 4, one joins late) greedy == single-sequence greedy, max|dlogit| 9.5e-06 < 1e-2
+PASS  scheduler over a HybridPool on Metal INT4: 1 preemptions, outputs == decoding alone, all KV blocks and state slots returned
+PASS  qwen2.5-0.5b metal: decode_batch (B up to 4, one joins late) greedy == single-sequence greedy, max|dlogit| 0.0e+00 < 1e-2
+
+45/45 passed

@@ -1,0 +1,44 @@
+layer types: LLLALLLALLLALLLALLLALLLA  (A = gated attention, L = Gated DeltaNet)
+PASS  prompt 0: tokenizer ids == HF ids (5 tokens)
+PASS  prompt 0 (5 tokens): embed exact, worst layer rel diff 2.4e-06 (layer 3, full_attention), final norm rel 1.3e-06, logits max|diff| 3.3e-05, top-1 100%
+PASS  prompt 1: tokenizer ids == HF ids (2 tokens)
+PASS  prompt 1 (2 tokens): embed exact, worst layer rel diff 2.2e-06 (layer 0, linear_attention), final norm rel 1.8e-06, logits max|diff| 3.9e-05, top-1 100%
+PASS  prompt 2: tokenizer ids == HF ids (4 tokens)
+PASS  prompt 2 (4 tokens): embed exact, worst layer rel diff 3.8e-06 (layer 4, linear_attention), final norm rel 1.1e-06, logits max|diff| 3.3e-05, top-1 100%
+PASS  prompt 3: tokenizer ids == HF ids (10 tokens)
+PASS  prompt 3 (10 tokens): embed exact, worst layer rel diff 1.6e-06 (layer 16, linear_attention), final norm rel 3.0e-06, logits max|diff| 5.7e-05, top-1 100%
+PASS  prompt 4: tokenizer ids == HF ids (14 tokens)
+PASS  prompt 4 (14 tokens): embed exact, worst layer rel diff 2.1e-06 (layer 4, linear_attention), final norm rel 1.3e-06, logits max|diff| 6.4e-05, top-1 100%
+PASS  prompt 5: tokenizer ids == HF ids (57 tokens)
+PASS  prompt 5 (57 tokens): embed exact, worst layer rel diff 2.4e-06 (layer 16, linear_attention), final norm rel 1.6e-06, logits max|diff| 4.4e-05, top-1 100%
+PASS  prompt 6: tokenizer ids == HF ids (126 tokens)
+PASS  prompt 6 (126 tokens): embed exact, worst layer rel diff 2.1e-06 (layer 23, full_attention), final norm rel 2.3e-06, logits max|diff| 5.1e-05, top-1 100%
+PASS  prompt 0: cached greedy == HF: ' Paris.\nThe capital of France is Paris.'
+PASS  prompt 1: cached greedy == HF: '\n\nHello world\n\nHello world\n\nHello world\n\n'
+PASS  prompt 2: cached greedy == HF: '\n    if n <= 0:\n       '
+PASS  prompt 3: cached greedy == HF: '\nThe quick brown fox jumps over the lazy dog'
+PASS  prompt 4: cached greedy == HF: '\nयह परीक्षण के लिए आपको एक'
+PASS  prompt 5: cached greedy == HF: '\n\nThe history of computing is also a story of'
+PASS  prompt 6: cached greedy == HF: ' Inference engines turn trained weights into answers. In'
+      greedy decoding, 7 prompts x 10 tokens: 8.3s
+PASS  hybrid state (contiguous KV + recurrent/conv): 126 tokens as 70 + 65 + singles == uncached, max|diff| 4.3e-05
+PASS  hybrid state (paged KV + recurrent/conv): 126 tokens as 70 + 65 + singles == uncached, max|diff| 4.3e-05
+PASS  KV exhaustion raises before any layer runs: recurrent and conv state unchanged, length unchanged
+PASS  free() returns the KV blocks and the state slot, zeroed, and detaches the state from it
+PASS  tokenizer: '<|audio_start|>' -> [248070], '<tts_pad>' -> [248072], decode round-trips
+PASS  qwen3.5 chat template matches HF (1 messages, thinking off)
+PASS  qwen3.5 chat template matches HF (1 messages, thinking on)
+PASS  qwen3.5 chat template matches HF (2 messages, thinking off)
+PASS  qwen3.5 chat template matches HF (2 messages, thinking on)
+PASS  qwen3.5 chat template matches HF (3 messages, thinking off)
+PASS  qwen3.5 chat template matches HF (3 messages, thinking on)
+PASS  qwen3.5 chat template matches HF (3 messages, thinking off)
+PASS  qwen3.5 chat template matches HF (3 messages, thinking on)
+PASS  qwen3.5 chat template matches HF (3 messages, thinking off)
+PASS  qwen3.5 chat template matches HF (3 messages, thinking on)
+PASS  qwen3.5 chat template matches HF (3 messages, thinking off)
+PASS  qwen3.5 chat template matches HF (3 messages, thinking on)
+PASS  fused Metal DeltaNet decode == reference over 4 steps (output rel / state / conv-tail worst 4.9e-07); other slots untouched
+PASS  Metal backend (bf16 weights): greedy matches HF fp32 for 70/70 tokens
+
+40/40 checks passed

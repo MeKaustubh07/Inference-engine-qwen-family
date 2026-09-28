@@ -1,0 +1,5 @@
+0: tokens= 5  embed max|diff|=0.00e+00  rmsnorm max|diff|=1.19e-07  PASS
+1: tokens= 2  embed max|diff|=0.00e+00  rmsnorm max|diff|=5.96e-08  PASS
+2: tokens= 4  embed max|diff|=0.00e+00  rmsnorm max|diff|=1.19e-07  PASS
+3: tokens=10  embed max|diff|=0.00e+00  rmsnorm max|diff|=2.38e-07  PASS
+4: tokens=11  embed max|diff|=0.00e+00  rmsnorm max|diff|=2.38e-07  PASS

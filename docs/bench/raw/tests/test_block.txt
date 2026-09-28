@@ -1,0 +1,5 @@
+0: tokens= 5  attention max|diff|=5.17e-07  block max|diff|=1.24e-05 (values up to 6.2)  PASS
+1: tokens= 2  attention max|diff|=4.71e-07  block max|diff|=1.54e-05 (values up to 3.0)  PASS
+2: tokens= 4  attention max|diff|=4.05e-06  block max|diff|=3.29e-05 (values up to 3.3)  PASS
+3: tokens=10  attention max|diff|=1.31e-06  block max|diff|=2.11e-05 (values up to 6.2)  PASS
+4: tokens=11  attention max|diff|=1.25e-06  block max|diff|=3.31e-05 (values up to 2.7)  PASS

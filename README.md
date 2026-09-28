@@ -1,0 +1,135 @@
+# Inference engine for Qwen3.5, from scratch, on an 8 GB Mac
+
+An LLM inference engine written from first principles in Python, with PyTorch used for tensors, devices and a
+few primitive ops (prefill runs PyTorch's GEMM), plus hand-written Metal kernels for decode. It serves **Qwen3.5-2B** (hybrid Gated DeltaNet + gated attention) in INT4 through
+an OpenAI-compatible API with continuous batching, on an Apple M2 with 8 GB of memory.
+
+Everything a model needs is implemented here: safetensors parsing, byte-level BPE, RMSNorm, RoPE, GQA attention,
+the chunked and recurrent gated delta rule, paged KV cache, sampling, chat templates, quantization, kernels,
+scheduler and server. The model path is checked against Hugging Face `transformers`; the serving path is checked
+against the engine's own one-request-at-a-time decoding (batched, preempted and streamed outputs must match it).
+
+- Design and trade-offs: [`docs/design.md`](docs/design.md)
+- Benchmarks: [`docs/bench/`](docs/bench/); every measurement in order: [`docs/results-log.md`](docs/results-log.md)
+
+## Results (MacBook Air M2, 8-core GPU, 8 GB)
+
+| Qwen3.5-2B | this engine INT4 (1.41 GB) | llama.cpp Q4_1 | MLX-LM 4-bit |
+|---|---:|---:|---:|
+| accuracy vs HF bf16 | KL 0.045, 3/190 top-1 flips | — | — |
+| single-stream decode (engine step) | 50 tok/s | 42–53 tok/s | 70 tok/s |
+| batch-8 aggregate decode (engine step) | **116 tok/s** | 62 tok/s | 73 tok/s |
+| prefill, 256 / 1024 tokens | 398 / 450 tok/s | 601 / 452 tok/s | 499 / 448 tok/s |
+| through the HTTP server, 8 clients | 56 tok/s (TTFT p50 1.4 s) | — | — |
+
+bf16 on our engine: KL 0.0004 with 0/190 flips; INT8: KL 0.0007 with greedy output identical to HF on all 70 test
+tokens. The server trails the engine step: new prompts are prefilled inside the decode loop, sampling runs on the
+CPU (~12 ms per batch-8 step), and ~28 ms per step of other server work is not yet profiled. Details and methodology: [`docs/bench/compare.md`](docs/bench/compare.md),
+[`docs/bench/qwen35.md`](docs/bench/qwen35.md), [`docs/bench/serving.md`](docs/bench/serving.md).
+
+## What is in it
+
+| layer | highlights |
+|---|---|
+| models | Qwen2.5-0.5B (bring-up), Qwen3.5-0.8B and Qwen3.5-2B (18 Gated DeltaNet + 6 gated-attention layers) |
+| correctness | vs HF `transformers`: Qwen2.5-0.5B layer-0 block ≤ 3.3e-5 and logits ≤ 3e-4 (fp32), greedy == HF on 5 prompts; Qwen3.5-0.8B every one of 24 layers ≤ 3.8e-6 relative (fp32), greedy identical on 7 prompts incl. Hindi; Qwen3.5-2B vs HF bf16 (fp32 does not fit in 8 GB): KL 0.0004 / 0.0007 / 0.045 for bf16 / INT8 / INT4, greedy 64 / 70 / 47 of 70 tokens, every divergence at a near-tie |
+| state | paged KV cache (block allocator, block tables) + fixed-size DeltaNet recurrent/conv state per sequence |
+| kernels (MSL) | bf16/INT8/INT4 matvec (+ batched), paged attention, batched DeltaNet step, RMSNorm, RoPE, fused SwiGLU, INT4/INT8 → fp32 expansion |
+| quantization | block-32 INT8, asymmetric INT4 with a calibrated per-tensor mixed-precision policy; `.qt` mmap format |
+| serving | continuous batching, recompute preemption, 429 backpressure, SSE streaming, cancellation, graceful drain |
+| operations | `/health`, `/ready`, Prometheus `/metrics` (TTFT/TPOT/e2e histograms), JSON request logs, Dockerfile |
+
+## Quick start
+
+```bash
+python3.14 -m venv scripts/.venv && scripts/.venv/bin/pip install -r requirements-dev.txt
+scripts/.venv/bin/hf download Qwen/Qwen3.5-2B --local-dir models/qwen3.5-2b
+```
+
+Quantize once (reads one tensor at a time, keeps the quantized output in memory and writes the file at the end;
+measured peak 3.5 GB for the 2B; uses the calibrated policy in `configs/quant/`):
+
+```bash
+scripts/.venv/bin/python scripts/quantize.py models/qwen3.5-2b/model.safetensors-00001-of-00001.safetensors models/qwen3.5-2b/model.int4.qt --scheme int4 --policy configs/quant/qwen3.5-2b.json --prefix model.language_model.
+```
+
+Chat in the terminal:
+
+```bash
+scripts/.venv/bin/python scripts/repl.py --model qwen3.5-2b --backend metal-int4 --weights models/qwen3.5-2b/model.int4.qt
+```
+
+Serve the OpenAI-compatible API:
+
+```bash
+scripts/.venv/bin/python scripts/serve.py --model qwen3.5-2b --backend metal-int4 --weights models/qwen3.5-2b/model.int4.qt
+```
+
+```bash
+curl -N http://127.0.0.1:8000/v1/chat/completions -H 'content-type: application/json' -d '{"messages":[{"role":"user","content":"Explain KV caching in two sentences."}],"stream":true}'
+```
+
+Any OpenAI client works with `base_url="http://127.0.0.1:8000/v1"`.
+
+## Tests
+
+The suites need more than the Quick start: the Qwen2.5-0.5B and Qwen3.5-0.8B checkpoints, the 2B INT8 file, the
+native runtime and the HF golden references (gitignored; generating them needs `transformers`). Once:
+
+```bash
+scripts/.venv/bin/hf download Qwen/Qwen2.5-0.5B-Instruct --local-dir models/qwen2.5-0.5b
+```
+
+```bash
+scripts/.venv/bin/hf download Qwen/Qwen3.5-0.8B --local-dir models/qwen3.5-0.8b
+```
+
+```bash
+scripts/.venv/bin/python scripts/quantize.py models/qwen3.5-2b/model.safetensors-00001-of-00001.safetensors models/qwen3.5-2b/model.int8.qt --scheme int8 --prefix model.language_model.
+```
+
+```bash
+scripts/build_native.sh && scripts/.venv/bin/python scripts/golden_layers.py && scripts/.venv/bin/python scripts/golden_qwen35.py && scripts/.venv/bin/python scripts/golden_qwen35.py models/qwen3.5-2b tests/golden_qwen35_2b bf16
+```
+
+Then:
+
+```bash
+scripts/.venv/bin/python scripts/run_tests.py
+```
+
+`--quick` skips the quantization, Qwen3.5 and serving suites. The 13 suites cover tokenizer, ops, blocks, full
+models, sampling, caches, kernels, native runtime, quantization, Qwen3.5-0.8B, Qwen3.5-2B (bf16/INT8/INT4) and the
+server (batched == sequential, preemption, streaming, 429, cancellation, drain). The last full run's output is in
+[`docs/bench/raw/tests/`](docs/bench/raw/tests/).
+
+## Benchmarks
+
+`scripts/bench.py` measures TTFT, TPOT, prefill/decode throughput and batched decode. `scripts/loadgen.py` drives
+a running server at several concurrency levels. Results and methodology are in [`docs/bench/`](docs/bench/).
+
+## Deployment
+
+| target | how |
+|---|---|
+| Mac, native (GPU) | `scripts/serve.py` as a launchd service (definition in `docs/design.md`) behind a reverse proxy or tunnel; Metal INT4 |
+| cloud Apple silicon | AWS EC2 Mac or Scaleway Apple silicon, same setup |
+| Linux / any Docker host | `docker build -t inference-engine .` then `docker run --stop-timeout 30 -p 8000:8000 -v "$PWD/models:/app/models:ro" inference-engine` (CPU backend; serves Qwen2.5-0.5B by default) |
+
+Docker on macOS cannot reach the Apple GPU (containers run in a Linux VM), so the Metal deployment is a native
+process. The image (1.37 GB, CPU fp32) was built and smoke-tested here: Qwen2.5-0.5B is ready in ~12 s, uses
+2.4 GB, decodes ~4 tok/s, passes the healthcheck, and `docker stop` drains an in-flight stream before exiting.
+Qwen3.5-0.8B in fp32 pages in that 4 GB VM (6 tokens in 114 s); give the VM more memory (6 GB or more suggested,
+not tested). See [`docs/design.md`](docs/design.md#9-deployment).
+
+## Layout
+
+```
+src/weight_loader.py   safetensors mmap loader          src/state.py        KV caches, block allocator, HybridState
+src/tokenizer.py       byte-level BPE                   src/quant.py        INT8/INT4, policy, .qt files
+src/chat.py            ChatML templates                 src/sampler.py      temperature/top-k/top-p/repetition
+src/models/            Qwen2.5, Qwen3.5 (hybrid)        src/engine.py       model registry, load_engine
+src/backend/           protocol, torch reference, Metal src/kernels/        *.metal kernels
+src/native/            Objective-C++ Metal runtime      src/server/         scheduler, API, metrics
+scripts/               goldens, bench, quantize, calibrate, serve, loadgen, repl, run_tests
+```
