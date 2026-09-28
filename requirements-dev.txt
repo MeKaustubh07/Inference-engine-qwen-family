@@ -1,0 +1,6 @@
+# Reference implementations for golden tests and downloading checkpoints (not needed to serve)
+-r requirements.txt
+transformers==5.16.1
+tokenizers==0.23.1
+safetensors==0.8.0
+huggingface_hub==1.29.0

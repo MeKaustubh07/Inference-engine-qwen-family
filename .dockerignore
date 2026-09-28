@@ -1,0 +1,8 @@
+.git
+models
+build
+scripts/.venv
+tests
+docs
+**/__pycache__
+*.log

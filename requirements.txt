@@ -1,0 +1,8 @@
+# Runtime (engine + server). On Linux install the CPU wheel: pip install torch --index-url https://download.pytorch.org/whl/cpu
+torch==2.14.0
+numpy==2.5.2
+regex==2026.9.3
+fastapi==0.141.1
+uvicorn==0.54.0
+pydantic==2.13.5
+httpx==0.28.1
