@@ -68,7 +68,7 @@ def bench_one(model, ids: list[int], new: int, use_cache: bool, sync) -> dict:
 
 def bench_batch(model, tok, B: int, steps: int, sync) -> float:
     """Median seconds per decode_batch step for B sequences (16-token prompts, paged KV)."""
-    pool = model.new_paged_pool(B * -(-(16 + steps + 1) // 16), 16)       # room for prompt + every step
+    pool = model.new_paged_pool(B * -(-(16 + steps + 1) // 16), 16, max_seqs=B)   # room for prompt + every step
     states = [model.new_paged_state(pool) for _ in range(B)]
     for st in states:
         model.forward(torch.tensor(prompt_ids(tok, 16)), state=st, last_only=True)

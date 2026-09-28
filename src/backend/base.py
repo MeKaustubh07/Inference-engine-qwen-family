@@ -47,3 +47,13 @@ class Backend(Protocol):
 
     def rms_norm_gated(self, x, z, w, eps) -> torch.Tensor:
         """RMSNorm(x) * w * silu(z) over the last dim."""
+
+    def deltanet_decode(self, qkv, z, b, a, state, slot, conv_w, A_log, dt_bias, norm_w, eps, dims) -> torch.Tensor:
+        """One token of one Gated DeltaNet layer (conv + delta rule + gated norm); updates state's slot in place."""
+
+    def deltanet_decode_batch(self, qkv, z, b, a, states, slot, conv_w, A_log, dt_bias, norm_w, eps,
+                              dims) -> torch.Tensor:
+        """The same for B sequences at once (row i belongs to states[i]) -> [B, H*dv]."""
+
+    def paged_attention(self, q, k_pool, v_pool, tables, lens, block_size) -> torch.Tensor:
+        """Batched decode attention reading a paged KV pool in place: q [B, Hq, d] -> [B, Hq, d]."""

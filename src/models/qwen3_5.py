@@ -13,7 +13,7 @@ import ops
 from backend.torch_ref import TorchBackend
 from config import Qwen35Config
 from quant import QuantTensor, concat_rows
-from state import ContiguousKVCache, HybridState, PagedKVPool
+from state import ContiguousKVCache, HybridPool, HybridState, PagedKVPool, PagedSequence
 
 P = "model.language_model."
 
@@ -69,13 +69,16 @@ class Qwen35Model:
         return HybridState(kv, len(self.linear_layers), c.linear_num_value_heads, c.linear_key_head_dim,
                            c.linear_value_head_dim, self.conv_dim, c.linear_conv_kernel_dim, device=self.b.device)
 
-    def new_paged_pool(self, num_blocks: int, block_size: int = 16) -> PagedKVPool:
+    def new_paged_pool(self, num_blocks: int, block_size: int = 16, max_seqs: int = 8) -> HybridPool:
+        """Paged KV blocks for the attention layers + `max_seqs` DeltaNet state slots (~19 MB each on 0.8B/2B)."""
         c = self.config
-        return PagedKVPool(len(self.attn_layers), c.num_key_value_heads, c.head_dim, num_blocks, block_size,
-                           device=self.b.device, dtype=torch.float32)
+        kv = PagedKVPool(len(self.attn_layers), c.num_key_value_heads, c.head_dim, num_blocks, block_size,
+                         device=self.b.device, dtype=torch.float32)
+        return HybridPool(kv, max_seqs, len(self.linear_layers), c.linear_num_value_heads, c.linear_key_head_dim,
+                          c.linear_value_head_dim, self.conv_dim, c.linear_conv_kernel_dim, device=self.b.device)
 
-    def new_paged_state(self, pool: PagedKVPool) -> HybridState:
-        return self.new_state(0, kv=pool.new_sequence())
+    def new_paged_state(self, pool: HybridPool) -> HybridState:
+        return pool.new_sequence()
 
     # ---------------------------------------------------------------- layers
     def embed(self, ids: torch.Tensor) -> torch.Tensor:
@@ -206,6 +209,11 @@ class Qwen35Model:
             st.reserve(st.length + 1)
         starts = [st.length for st in states]
         positions = torch.tensor(starts, device=b.device, dtype=torch.int32)
+        kvs = [st.kv for st in states]
+        paged = all(isinstance(kv, PagedSequence) and kv.pool is kvs[0].pool for kv in kvs)
+        if paged:                                       # one KV write and one attention dispatch per layer for all
+            kv_pool = kvs[0].pool
+            blocks, offsets, tables, lens = kv_pool.batch_layout(kvs, starts)
         h = self.embed(torch.tensor(tokens))
         for i in range(c.num_hidden_layers):
             x = b.rms_norm(h, self._vec(f"layers.{i}.input_layernorm.weight", one_plus=True), c.rms_norm_eps)
@@ -220,12 +228,18 @@ class Qwen35Model:
                 qk = b.rope(torch.cat([q[..., :r], k[..., :r]], dim=1).contiguous(), positions, c.rope_theta)
                 q = torch.cat([qk[:, :Hq], q[..., r:]], dim=-1)
                 k = torch.cat([qk[:, Hq:], k[..., r:]], dim=-1)
-                outs = []
-                for j, st in enumerate(states):
-                    st.kv.write(self.slot[i], starts[j], k[j:j + 1], v[j:j + 1])
-                    K, V = st.kv.read(self.slot[i], starts[j] + 1)
-                    outs.append(b.attention(q[j:j + 1].contiguous(), K, V, causal=True))
-                o = torch.cat(outs).reshape(B, Hq * d) * torch.sigmoid(gate)
+                if paged:
+                    L = self.slot[i]
+                    kv_pool.write_batch(L, blocks, offsets, k, v)
+                    o = b.paged_attention(q, kv_pool.k[L], kv_pool.v[L], tables, lens, kv_pool.block_size)
+                else:
+                    outs = []
+                    for j, st in enumerate(states):
+                        st.kv.write(self.slot[i], starts[j], k[j:j + 1], v[j:j + 1])
+                        K, V = st.kv.read(self.slot[i], starts[j] + 1)
+                        outs.append(b.attention(q[j:j + 1].contiguous(), K, V, causal=True))
+                    o = torch.cat(outs)
+                o = o.reshape(B, Hq * d) * torch.sigmoid(gate)
                 h = b.linear(o, self._w(p + "o_proj.weight"), residual=h)
             else:
                 p = f"layers.{i}.linear_attn."
@@ -235,11 +249,10 @@ class Qwen35Model:
                 qkv, z = y[:, : self.conv_dim], y[:, self.conv_dim:self.conv_dim + self.value_dim]
                 beta_logit, a = y[:, -2 * H:-H], y[:, -H:]
                 conv_w = self._vec(p + "conv1d.weight").squeeze(1)
-                outs = [b.deltanet_decode(qkv[j:j + 1], z[j:j + 1], beta_logit[j:j + 1], a[j:j + 1], st, self.slot[i],
-                                          conv_w, self._vec(p + "A_log"), self._vec(p + "dt_bias"),
-                                          self._vec(p + "norm.weight"), c.rms_norm_eps, (H, dk, dv, self.key_dim))
-                        for j, st in enumerate(states)]
-                h = b.linear(torch.cat(outs), self._w(p + "out_proj.weight"), residual=h)
+                o = b.deltanet_decode_batch(qkv, z, beta_logit, a, states, self.slot[i], conv_w, self._vec(p + "A_log"),
+                                            self._vec(p + "dt_bias"), self._vec(p + "norm.weight"), c.rms_norm_eps,
+                                            (H, dk, dv, self.key_dim))
+                h = b.linear(o, self._w(p + "out_proj.weight"), residual=h)
             x = b.rms_norm(h, self._vec(f"layers.{i}.post_attention_layernorm.weight", one_plus=True), c.rms_norm_eps)
             h = self.mlp(i, x, residual=h)
         for st in states:

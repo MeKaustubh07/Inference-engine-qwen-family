@@ -51,7 +51,7 @@ class Scheduler:
         self.eng, self.metrics = engine, metrics
         self.model, self.tok = engine.model, engine.tokenizer
         self.max_batch, self.max_waiting, self.max_model_len = max_batch, max_waiting, max_model_len
-        self.pool = self.model.new_paged_pool(kv_blocks, block_size)
+        self.pool = self.model.new_paged_pool(kv_blocks, block_size, max_seqs=max(max_batch, 2))
         self.block_size = block_size
         self.waiting: collections.deque[Request] = collections.deque()
         self.running: list[Request] = []

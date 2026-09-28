@@ -83,6 +83,7 @@ class OutputFilter:
         self.in_reasoning, self.stops, self.buf = thinking, stops, ""
         self.keep = max((len(s) for s in stops), default=1) - 1
         self.stopped = False
+        self.lead = False                                     # drop the newlines between </think> and the answer
 
     def feed(self, piece: str) -> list[tuple[str, str]]:
         out = []
@@ -92,7 +93,10 @@ class OutputFilter:
                 out.append(("reasoning", reasoning))
             if not sep:
                 return out
-            self.in_reasoning, piece = False, piece.lstrip("\n")
+            self.in_reasoning, self.lead = False, True
+        if self.lead:                                         # they may arrive in later pieces than </think>
+            piece = piece.lstrip("\n")
+            self.lead = not piece
         self.buf += piece
         hits = [i for i in (self.buf.find(s) for s in self.stops) if i >= 0]
         if hits:
@@ -229,7 +233,7 @@ def create_app(engine, max_batch: int = 8, max_waiting: int = 64, kv_blocks: int
             if chat:
                 msg = {"role": "assistant", "content": text}
                 if thinking:
-                    msg["reasoning_content"] = "".join(reasoning)
+                    msg["reasoning_content"] = "".join(reasoning).strip()
                 choice = {"message": msg}
             else:
                 choice = {"text": text}

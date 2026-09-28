@@ -35,6 +35,7 @@ class MetalBackend(TorchBackend):
         self.lib = load_library()
         self._no_bias = torch.zeros(1, dtype=torch.bfloat16, device=self.device)
         self._no_res = torch.zeros(1, device=self.device)
+        self._seq0 = torch.zeros(1, dtype=torch.int32, device=self.device)   # a standalone state = sequence 0
 
     def prepare(self, w, name=None):
         if isinstance(w, QuantTensor):
@@ -78,10 +79,12 @@ class MetalBackend(TorchBackend):
                 self.lib.matvec_q8(*args, threads=N * 32, group_size=TG)
             else:
                 self.lib.matvec_q4(*args, w.mins, threads=N * 32, group_size=TG)
-        elif w.scheme == "int8":                           # batched decode: weights read once for all M rows
-            self.lib.matvec_q8_batch(*args, M, threads=N * 32, group_size=TG)
-        else:
-            self.lib.matvec_q4_batch(*args, w.mins, M, threads=N * 32, group_size=TG)
+        else:                                              # batched decode: weights read once for all M rows
+            g = -(-N // 2) * 32                            # 2 output rows per SIMD group
+            if w.scheme == "int8":
+                self.lib.matvec_q8_rows(*args, M, threads=g, group_size=TG)
+            else:
+                self.lib.matvec_q4_rows(*args, w.mins, M, threads=g, group_size=TG)
         return y
 
     def linear(self, x, w, b=None, residual=None):
@@ -100,7 +103,7 @@ class MetalBackend(TorchBackend):
         if M == 1:
             self.lib.matvec_bf16(*args, threads=N * 32, group_size=TG)
         else:                                              # batched decode: fp32 activations, weights read once
-            self.lib.matvec_bf16_batch(*args, M, threads=N * 32, group_size=TG)
+            self.lib.matvec_bf16_rows(*args, M, threads=-(-N // 2) * 32, group_size=TG)
         return y
 
     def gemm(self, x, w):
@@ -156,6 +159,19 @@ class MetalBackend(TorchBackend):
                                   scores, S, Hkv, Hq // Hkv, d, threads=Hq * TG, group_size=TG)
         return out
 
+    def paged_attention(self, q, k_pool, v_pool, tables, lens, block_size):
+        """One dispatch for the whole batch: every (head, sequence) reads its keys/values in place via its block
+        table (no per-sequence gather)."""
+        B, Hq, d = q.shape
+        Hkv = k_pool.shape[2]
+        max_len = tables.shape[1] * block_size
+        out = torch.empty(B, Hq, d, device=self.device)
+        scores = torch.empty(B, Hq, max_len, device=self.device)
+        self.lib.paged_attention_decode(out, q.float().contiguous(), k_pool, v_pool, scores, tables, lens,
+                                        tables.shape[1], max_len, block_size, Hkv, Hq // Hkv, d,
+                                        threads=(Hq * TG, B), group_size=(TG, 1))
+        return out
+
     def silu_mul(self, gate, up):
         gate, up = gate.float().contiguous(), up.float().contiguous()
         out = torch.empty_like(gate)
@@ -165,12 +181,26 @@ class MetalBackend(TorchBackend):
 
     def deltanet_decode(self, qkv, z, b, a, state, slot, conv_w, A_log, dt_bias, norm_w, eps, dims):
         """Fused Metal path: conv_step + gdn_decode (2 dispatches instead of ~20 tensor ops)."""
+        return self.deltanet_decode_batch(qkv, z, b, a, [state], slot, conv_w, A_log, dt_bias, norm_w, eps, dims)
+
+    def deltanet_decode_batch(self, qkv, z, b, a, states, slot, conv_w, A_log, dt_bias, norm_w, eps, dims):
+        """All B sequences in 2 dispatches when their states share one HybridPool (the server's case); a lone
+        standalone state is treated as a pool of one. Otherwise, one sequence at a time."""
+        pool = getattr(states[0], "pool", None)
+        if len(states) == 1 and pool is None:
+            S, conv, n_linear, seqs = states[0].S, states[0].conv_tail, states[0].S.shape[0], self._seq0
+        elif pool is not None and all(getattr(st, "pool", None) is pool for st in states):
+            S, conv, n_linear = pool.S, pool.conv, pool.S.shape[1]
+            seqs = torch.tensor([st.seq for st in states], dtype=torch.int32).to(self.device, non_blocking=True)
+        else:
+            return super().deltanet_decode_batch(qkv, z, b, a, states, slot, conv_w, A_log, dt_bias, norm_w, eps, dims)
         H, dk, dv, key_dim = dims
-        C = qkv.shape[-1]
-        u = torch.empty(C, device=self.device)
-        self.lib.conv_step(u, qkv.float().contiguous(), state.conv_tail, conv_w.contiguous(), C, slot,
-                           threads=C, group_size=TG)
-        out = torch.empty(1, H * dv, device=self.device)
+        B, C = qkv.shape
+        u = torch.empty(B, C, device=self.device)
+        self.lib.conv_step(u, qkv.float().contiguous(), conv, conv_w.contiguous(), C, slot, n_linear, seqs,
+                           threads=(C, B), group_size=(TG, 1))
+        out = torch.empty(B, H * dv, device=self.device)
         self.lib.gdn_decode(out, u, z.float().contiguous(), b.float().contiguous(), a.float().contiguous(),
-                            A_log, dt_bias, norm_w, state.S, H, dk, slot, float(eps), threads=H * dv, group_size=dv)
+                            A_log, dt_bias, norm_w, S, H, dk, slot, float(eps), n_linear, seqs,
+                            threads=(H * dv, B), group_size=(dv, 1))
         return out

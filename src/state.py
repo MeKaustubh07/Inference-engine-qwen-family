@@ -77,6 +77,23 @@ class PagedKVPool:
     def new_sequence(self) -> "PagedSequence":
         return PagedSequence(self)
 
+    def batch_layout(self, seqs: list["PagedSequence"], starts: list[int]):
+        """For a batched decode step (one new token per sequence at position starts[i], blocks already reserved):
+        where each new token goes (block, offset) and each sequence's block table / length after it, as device
+        tensors, built once per step and shared by every layer."""
+        bs, dev = self.block_size, self.k.device
+        blocks = torch.tensor([s.block_table[p // bs] for s, p in zip(seqs, starts)])
+        offsets = torch.tensor([p % bs for p in starts])
+        width = max(len(s.block_table) for s in seqs)
+        tables = torch.tensor([s.block_table + [0] * (width - len(s.block_table)) for s in seqs], dtype=torch.int32)
+        lens = torch.tensor([p + 1 for p in starts], dtype=torch.int32)
+        return tuple(t.to(dev, non_blocking=True) for t in (blocks, offsets, tables, lens))
+
+    def write_batch(self, layer: int, blocks: torch.Tensor, offsets: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+        """k, v: [B, kv_heads, head_dim], one new token per sequence."""
+        self.k[layer, blocks, offsets] = k.to(self.k.dtype)
+        self.v[layer, blocks, offsets] = v.to(self.v.dtype)
+
 
 class PagedSequence:
     """One sequence's view of the pool: a block table mapping logical positions to physical blocks.
@@ -141,13 +158,18 @@ class HybridState:
     attention layers -> a KV cache (ContiguousKVCache or PagedSequence), indexed by attention-layer slot
     linear layers    -> a fixed-size recurrent state S [H, dk, dv] (fp32) and the last K-1 raw conv inputs [K-1, C]
     The linear-layer state never grows with the sequence: that is the point of linear attention.
+    Standalone states own their S / conv_tail; states from a HybridPool are views of one pool slot (`seq`).
     """
 
-    def __init__(self, kv, n_linear: int, n_heads: int, dk: int, dv: int, conv_dim: int, conv_k: int,
-                 device: torch.device | str = "cpu"):
-        self.kv = kv
-        self.S = torch.zeros(n_linear, n_heads, dk, dv, device=device, dtype=torch.float32)
-        self.conv_tail = torch.zeros(n_linear, conv_k - 1, conv_dim, device=device, dtype=torch.float32)
+    def __init__(self, kv, n_linear: int = 0, n_heads: int = 0, dk: int = 0, dv: int = 0, conv_dim: int = 0,
+                 conv_k: int = 1, device: torch.device | str = "cpu", pool: "HybridPool | None" = None,
+                 seq: int | None = None):
+        self.kv, self.pool, self.seq = kv, pool, seq
+        if pool is not None:
+            self.S, self.conv_tail = pool.S[seq], pool.conv[seq]
+        else:
+            self.S = torch.zeros(n_linear, n_heads, dk, dv, device=device, dtype=torch.float32)
+            self.conv_tail = torch.zeros(n_linear, conv_k - 1, conv_dim, device=device, dtype=torch.float32)
 
     @property
     def length(self) -> int:
@@ -160,12 +182,48 @@ class HybridState:
         self.kv.reserve(end)
 
     def free(self) -> None:
-        """Release KV blocks and reset the recurrent/conv state so the object can't leak history into a reuse."""
+        """Release KV blocks and reset the recurrent/conv state so the object can't leak history into a reuse.
+        A pooled state gives its slot back (zeroed) and must not be used afterwards."""
         if hasattr(self.kv, "free"):
             self.kv.free()
-        self.S.zero_()
-        self.conv_tail.zero_()
+        if self.pool is not None:
+            self.pool.release(self.seq)
+            self.pool = None
+        elif self.seq is None:
+            self.S.zero_()
+            self.conv_tail.zero_()
 
     def bytes_used(self) -> int:
         fixed = (self.S.numel() + self.conv_tail.numel()) * 4
         return self.kv.bytes_used() + fixed
+
+
+class HybridPool:
+    """Storage shared by many Qwen3.5 sequences: the paged KV pool for the attention layers, plus one fixed-size
+    recurrent/conv state slot per sequence for the DeltaNet layers. With every sequence's DeltaNet state in one
+    tensor, a batched decode updates all of them in one kernel dispatch per layer instead of one per sequence."""
+
+    def __init__(self, kv: PagedKVPool, max_seqs: int, n_linear: int, n_heads: int, dk: int, dv: int,
+                 conv_dim: int, conv_k: int, device: torch.device | str = "cpu"):
+        self.kv = kv
+        self.S = torch.zeros(max_seqs, n_linear, n_heads, dk, dv, device=device, dtype=torch.float32)
+        self.conv = torch.zeros(max_seqs, n_linear, conv_k - 1, conv_dim, device=device, dtype=torch.float32)
+        self.free_seqs = list(range(max_seqs - 1, -1, -1))
+
+    @property
+    def allocator(self) -> BlockAllocator:                   # KV block accounting, as on PagedKVPool
+        return self.kv.allocator
+
+    @property
+    def block_size(self) -> int:
+        return self.kv.block_size
+
+    def new_sequence(self) -> HybridState:
+        if not self.free_seqs:
+            raise OutOfBlocks(f"all {self.S.shape[0]} sequence state slots are in use")
+        return HybridState(self.kv.new_sequence(), pool=self, seq=self.free_seqs.pop())
+
+    def release(self, seq: int) -> None:
+        self.S[seq].zero_()
+        self.conv[seq].zero_()
+        self.free_seqs.append(seq)

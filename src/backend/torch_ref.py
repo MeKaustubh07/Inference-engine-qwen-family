@@ -69,6 +69,22 @@ class TorchBackend:
         o, state.S[slot] = self.gated_delta(q, k, v, beta, g, state.S[slot])
         return self.rms_norm_gated(o.reshape(H, dv), z.reshape(H, dv), norm_w, eps).reshape(1, H * dv)
 
+    def paged_attention(self, q, k_pool, v_pool, tables, lens, block_size):
+        """Batched decode attention over paged KV: q [B, Hq, d]; k_pool/v_pool one layer [blocks, bs, Hkv, d];
+        tables [B, max_nb], lens [B]. Reference: gather each sequence's positions, then ordinary attention."""
+        outs = []
+        for i in range(q.shape[0]):
+            n = int(lens[i]); nb = -(-n // block_size)
+            K = k_pool[tables[i, :nb].long()].flatten(0, 1)[:n]
+            V = v_pool[tables[i, :nb].long()].flatten(0, 1)[:n]
+            outs.append(self.attention(q[i:i + 1], K, V, causal=True))
+        return torch.cat(outs)
+
+    def deltanet_decode_batch(self, qkv, z, b, a, states, slot, conv_w, A_log, dt_bias, norm_w, eps, dims):
+        """B sequences, one token each: rows of qkv/z/b/a belong to states[i]. Returns [B, H*dv]."""
+        return torch.cat([self.deltanet_decode(qkv[i:i + 1], z[i:i + 1], b[i:i + 1], a[i:i + 1], st, slot, conv_w,
+                                               A_log, dt_bias, norm_w, eps, dims) for i, st in enumerate(states)])
+
     def sync(self) -> None:
         """Wait for queued GPU work (needed for honest timing on MPS)."""
         if self.device.type == "mps":

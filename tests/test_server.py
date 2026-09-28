@@ -93,6 +93,10 @@ got = f.feed("Let me think") + f.feed(" about it.</think>\n\nThe answer") + f.fe
 check("thinking mode: text before </think> is reasoning, after it content",
       got == [("reasoning", "Let me think"), ("reasoning", " about it."), ("content", "The answer"), ("content", " is 4.")])
 f = OutputFilter(True, [])
+got = f.feed("ok</think>") + f.feed("\n") + f.feed("\nAnswer\n") + f.flush()
+check("newlines after </think> are dropped even when they arrive in later pieces",
+      got == [("reasoning", "ok"), ("content", "Answer\n")])
+f = OutputFilter(True, [])
 check("thinking mode cut off by max_tokens: everything is reasoning, no content",
       f.feed("still thinking") + f.flush() == [("reasoning", "still thinking")])
 f = OutputFilter(False, ["END", "\n\n"])
@@ -356,16 +360,16 @@ for scheme in ["bf16", "int8", "int4"]:
     check(f"batched {scheme} matvec (M=2,3,8,13,32; with/without bias and residual) == per-row kernel == dense "
           f"(worst {worst:.1e})", worst < 1e-3)
 
-for backend in ["metal", "metal-int4"]:
-    # batched decode uses the same fp32-activation kernels as single-sequence decode, so a request's output must
-    # not depend on how many others share its batch: greedy identical, logits equal to float rounding
-    eng = load_engine("qwen3.5-0.8b", backend)
+for name, backend in [("qwen3.5-0.8b", "metal"), ("qwen3.5-0.8b", "metal-int4"), ("qwen2.5-0.5b", "metal")]:
+    # batched decode (pooled DeltaNet state, paged attention, batched matvec kernels) uses the same fp32 math as
+    # single-sequence decode, so a request's output must not depend on how many others share its batch
+    eng = load_engine(name, backend)
     V, N = eng.tokenizer.vocab_size(), 12
     ids = [eng.tokenizer.encode(p) for p in PROMPTS]
     ref = [sequential(eng.model, V, x, N) for x in ids]
     got, logs, pool = batched(eng.model, V, ids, N, join_at=[0, 0, 0, 2])
     worst = max((a - b).abs().max().item() for j in range(4) for a, b in zip(logs[j], ref[j][1]))
-    check(f"{backend}: decode_batch (B up to 4, one joins late) greedy == single-sequence greedy, "
+    check(f"{name} {backend}: decode_batch (B up to 4, one joins late) greedy == single-sequence greedy, "
           f"max|dlogit| {worst:.1e} < 1e-2", all(got[j] == ref[j][0] for j in range(4)) and worst < 1e-2)
     del eng
     gc.collect(); torch.mps.empty_cache()

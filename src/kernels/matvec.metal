@@ -31,44 +31,48 @@ kernel void matvec_bf16(device float* y          [[buffer(0)]],
     if (lane == 0) y[row] = acc + (has_bias ? float(b[row]) : 0.0f) + (has_res ? res[row] : 0.0f);
 }
 
-// Batched decode (continuous batching): M <= MAX_BATCH sequences share one pass over W. Same fp32 math per row as
-// matvec_bf16, so a sequence's logits do not depend on how many other requests are in the batch.
-// x, y and res are row-major [M, K], [M, N], [M, N].
 constant uint MAX_BATCH = 8;                          // also used by qmatvec.metal (all files compile as one source)
 
-kernel void matvec_bf16_batch(device float* y          [[buffer(0)]],
-                              device const bfloat* W   [[buffer(1)]],
-                              device const float* x    [[buffer(2)]],
-                              device const bfloat* b   [[buffer(3)]],
-                              device const float* res  [[buffer(4)]],
-                              constant uint& K         [[buffer(5)]],
-                              constant uint& N         [[buffer(6)]],
-                              constant uint& has_bias  [[buffer(7)]],
-                              constant uint& has_res   [[buffer(8)]],
-                              constant uint& M         [[buffer(9)]],
-                              uint gid  [[thread_position_in_grid]],
-                              uint lane [[thread_index_in_simdgroup]]) {
-    uint row = gid / 32;
-    if (row >= N) return;
-    device const bfloat* wr = W + (ulong)row * K;
-    float acc[MAX_BATCH] = {0.0f};
-    if ((K & 127) == 0) {
-        device const bfloat4* w4 = (device const bfloat4*)wr;
-        device const float4* x4 = (device const float4*)x;
-        for (uint j = lane; j < K / 4; j += 32) {
-            float4 w = float4(w4[j]);                          // read once, used by all M rows
-            for (uint m = 0; m < M; m++) acc[m] += dot(w, x4[m * (K / 4) + j]);
-        }
-    } else {
-        for (uint j = lane; j < K; j += 32) {
-            float w = float(wr[j]);
-            for (uint m = 0; m < M; m++) acc[m] += w * x[m * K + j];
+// Decode matvec for M <= 8 activation rows, R = 2 output rows per SIMD group. For each step a lane dequantizes
+// its 8 weights of all R rows once, then loads each x value once and uses it for all R rows: x is read R times
+// less often than with one row per SIMD group (with M = 8, x traffic, not weight traffic, was the bottleneck).
+// Loops over M and R are fully unrolled with guards, so accumulators stay in registers. Used for M >= 4, where
+// it beat the one-row batched kernels (measured: 2 rows > 4 rows > 1 row per SIMD group at M = 4..8).
+constant uint RR = 2;                           // output rows per SIMD group
+
+#define ROWS_EPILOGUE                                                                             \
+    for (uint r = 0; r < RR; r++) {                                                               \
+        uint row = row0 + r;                                                                      \
+        for (uint m = 0; m < MAX_BATCH; m++) {                                                           \
+            if (m < M) {                                                                          \
+                float a = simd_sum(acc[r][m]);                                                    \
+                if (lane == 0 && row < N)                                                         \
+                    y[m * N + row] = a + (has_bias ? float(b[row]) : 0.0f) + (has_res ? res[m * N + row] : 0.0f); \
+            }                                                                                     \
+        }                                                                                         \
+    }
+
+kernel void matvec_bf16_rows(device float* y [[buffer(0)]], device const bfloat4* W [[buffer(1)]],
+                             device const float4* x [[buffer(2)]], device const bfloat* b [[buffer(3)]],
+                             device const float* res [[buffer(4)]], constant uint& K [[buffer(5)]],
+                             constant uint& N [[buffer(6)]], constant uint& has_bias [[buffer(7)]],
+                             constant uint& has_res [[buffer(8)]], constant uint& M [[buffer(9)]],
+                             uint gid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+    uint row0 = (gid / 32) * RR;
+    if (row0 >= N) return;
+    float acc[RR][MAX_BATCH];
+    for (uint r = 0; r < RR; r++) for (uint m = 0; m < MAX_BATCH; m++) acc[r][m] = 0.0f;
+    for (uint j = lane; j < K / 4; j += 32) {
+        float4 w[RR];
+        for (uint r = 0; r < RR; r++) w[r] = float4(W[(ulong)min(row0 + r, N - 1) * (K / 4) + j]);
+        for (uint m = 0; m < MAX_BATCH; m++) {
+            if (m < M) {
+                float4 xv = x[m * (K / 4) + j];
+                for (uint r = 0; r < RR; r++) acc[r][m] += dot(w[r], xv);
+            }
         }
     }
-    for (uint m = 0; m < M; m++) {
-        float a = simd_sum(acc[m]);
-        if (lane == 0) y[m * N + row] = a + (has_bias ? float(b[row]) : 0.0f) + (has_res ? res[m * N + row] : 0.0f);
-    }
+    ROWS_EPILOGUE
 }
 
 // Fused SwiGLU for decode: Wgu = [gate; up] stacked, shape [2F, K]. Output row i reads gate row i and

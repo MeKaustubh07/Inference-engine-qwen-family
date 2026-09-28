@@ -4,7 +4,7 @@ import torch
 from backend.torch_ref import TorchBackend
 from config import ModelConfig
 from quant import concat_rows
-from state import ContiguousKVCache, PagedKVPool
+from state import ContiguousKVCache, PagedKVPool, PagedSequence
 from weight_loader import SafetensorsFile
 
 
@@ -32,7 +32,7 @@ class Qwen2Model:
         return ContiguousKVCache(cfg.num_hidden_layers, cfg.num_key_value_heads, cfg.head_dim, max_len,
                                  device=self.b.device, dtype=torch.float32)
 
-    def new_paged_pool(self, num_blocks: int, block_size: int = 16) -> PagedKVPool:
+    def new_paged_pool(self, num_blocks: int, block_size: int = 16, max_seqs: int | None = None) -> PagedKVPool:
         cfg = self.config
         return PagedKVPool(cfg.num_hidden_layers, cfg.num_key_value_heads, cfg.head_dim, num_blocks, block_size,
                            device=self.b.device, dtype=torch.float32)
@@ -141,6 +141,10 @@ class Qwen2Model:
             st.reserve(st.length + 1)
         starts = [st.length for st in states]
         positions = torch.tensor(starts, device=b.device, dtype=torch.int32)
+        paged = all(isinstance(st, PagedSequence) and st.pool is states[0].pool for st in states)
+        if paged:                                       # one KV write and one attention dispatch per layer for all
+            pool = states[0].pool
+            blocks, offsets, tables, lens = pool.batch_layout(states, starts)
         h = self.embed(torch.tensor(tokens))
         for layer in range(cfg.num_hidden_layers):
             p = f"model.layers.{layer}."
@@ -154,12 +158,17 @@ class Qwen2Model:
             v = qkv[:, (Hq + Hkv) * d:].reshape(B, Hkv, d)
             qk = b.rope(torch.cat([q, k], dim=1), positions, cfg.rope_theta)       # row i rotated by its own position
             q, k = qk[:, :Hq], qk[:, Hq:]
-            outs = []
-            for i, st in enumerate(states):
-                st.write(layer, starts[i], k[i:i + 1], v[i:i + 1])
-                K, V = st.read(layer, starts[i] + 1)
-                outs.append(b.attention(q[i:i + 1].contiguous(), K, V, causal=True))
-            h = b.linear(torch.cat(outs).reshape(B, -1), self._w(a + "o_proj.weight"), residual=h)
+            if paged:
+                pool.write_batch(layer, blocks, offsets, k, v)
+                o = b.paged_attention(q, pool.k[layer], pool.v[layer], tables, lens, pool.block_size)
+            else:
+                outs = []
+                for i, st in enumerate(states):
+                    st.write(layer, starts[i], k[i:i + 1], v[i:i + 1])
+                    K, V = st.read(layer, starts[i] + 1)
+                    outs.append(b.attention(q[i:i + 1].contiguous(), K, V, causal=True))
+                o = torch.cat(outs)
+            h = b.linear(o.reshape(B, -1), self._w(a + "o_proj.weight"), residual=h)
             h = self.mlp(layer, b.rms_norm(h, self._w(p + "post_attention_layernorm.weight"), cfg.rms_norm_eps), residual=h)
         for st in states:
             st.advance(1)
