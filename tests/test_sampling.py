@@ -109,5 +109,59 @@ check("real reply stops on EOS before the token limit", rec["stop"] == "eos" and
 check("real reply stream == decode(generated ids)", reply == tok.decode(rec["ids"]))
 check("real reply mentions Paris", "Paris" in reply)
 
+# 9. batched sampling (the server's path) == sampling each row alone, token for token, same seeds
+from sampler import sample_batch
+def compare(device, trials=300):
+    rng = torch.Generator().manual_seed(7)
+    mismatches = 0
+    for t in range(trials):
+        B, V = 1 + t % 8, 5000
+        logits = torch.randn(B, V, generator=rng) * 4
+        if t % 7 == 0:
+            logits[0, :50] = logits[0].max()                      # 50-way tie at the top: forces the tie fallback
+        if t % 7 == 3:                                             # 30 tokens tied at ranks 16-45: a tie group
+            order = torch.argsort(logits[0], descending=True)      # straddling the top-k cut (top_k 20 or 40)
+            logits[0, order[15:45]] = logits[0, order[15]].item()
+        params = [SamplingParams(temperature=[0.0, 0.7, 1.3][(t + i) % 3], top_k=[20, 1, 0, 40, 300][(t + i) % 5],
+                                 top_p=[0.8, 1.0, 0.95][(t + i) % 3], repetition_penalty=[1.0, 1.3][(t + i) % 2])
+                  for i in range(B)]
+        prev = [torch.randint(0, V, (1 + (t + i) % 30,), generator=rng).tolist() for i in range(B)]
+        if t % 3 == 1:                                             # the history holds each row's 25 best tokens, as in
+            prev = [p + torch.topk(logits[i], 25).indices.tolist() for i, p in enumerate(prev)]   # real text: the
+            # penalty reorders the top, so candidates must be picked by penalized logit, not raw
+        want = [sample(logits[i], prev[i], params[i], torch.Generator().manual_seed(t * 10 + i)) for i in range(B)]
+        got = sample_batch(logits.to(device), prev, params, [torch.Generator().manual_seed(t * 10 + i) for i in range(B)])
+        mismatches += sum(a != b for a, b in zip(want, got))
+    return mismatches
+for device in ["cpu"] + (["mps"] if torch.backends.mps.is_available() else []):
+    m = compare(device)
+    check(f"sample_batch == sample row by row on {device} (300 random batches: greedy, penalties on the top tokens, "
+          f"top-k off or above the batch cap, all-tie and straddling ties): {m} mismatches", m == 0)
+
+# a row that cannot be sampled fails alone: its seeded batch-mate draws exactly what it would alone
+bad = torch.randn(2, 1000)
+bad[1] = float("nan")
+p = SamplingParams(temperature=1.0, top_k=50, top_p=0.95, repetition_penalty=1.0)
+alone = sample(bad[0], [], p, torch.Generator().manual_seed(5))
+got = sample_batch(bad, [[], []], [p, p], [torch.Generator().manual_seed(5), torch.Generator().manual_seed(6)])
+check(f"a NaN row yields its error while its seeded batch-mate keeps its own first draw ({got[0]} == {alone})",
+      got[0] == alone and isinstance(got[1], Exception))
+
+# one request asking for a huge top-k must not slow the whole batch down (it takes the per-row path)
+import time
+V = 150000
+logits = torch.randn(8, V)
+prev = [list(range(0, 3000, 7))] * 8
+base = [SamplingParams(temperature=0.7, top_k=20, repetition_penalty=1.1)] * 8
+huge = [SamplingParams(temperature=0.7, top_k=149000, repetition_penalty=1.1)] + base[1:]
+def timed(params):
+    t0 = time.perf_counter()
+    sample_batch(logits, prev, params, [torch.Generator().manual_seed(i) for i in range(8)])
+    return time.perf_counter() - t0
+timed(base)
+t_base, t_huge = timed(base), timed(huge)
+check(f"a batch-mate with top_k=149000 costs only its own row: {t_base * 1e3:.0f} ms -> {t_huge * 1e3:.0f} ms "
+      f"(< base + 150 ms)", t_huge < t_base + 0.15)
+
 print(f"\n{sum(results)}/{len(results)} checks passed")
 sys.exit(0 if all(results) else 1)

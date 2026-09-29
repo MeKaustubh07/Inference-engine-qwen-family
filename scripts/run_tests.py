@@ -1,6 +1,6 @@
 """Run every test script in sequence (each needs the model weights) and summarize. Exit 1 if any fails.
 
-usage: run_tests.py [--quick]      (--quick skips the slow quantization, Qwen3.5 and serving suites)
+usage: run_tests.py [--quick]      (--quick skips the slow quantization, Qwen3.5, serving and prefill suites)
 """
 import subprocess
 import sys
@@ -9,8 +9,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 TESTS = ["test_tokenizer", "test_ops", "test_block", "test_model", "test_sampling", "test_cache", "test_paged",
-         "test_kernels", "test_native", "test_quant", "test_qwen35", "test_qwen35_2b", "test_server"]
-SLOW = {"test_quant", "test_qwen35", "test_qwen35_2b", "test_server"}
+         "test_kernels", "test_native", "test_quant", "test_qwen35", "test_qwen35_2b", "test_server", "test_prefill"]
+SLOW = {"test_quant", "test_qwen35", "test_qwen35_2b", "test_server", "test_prefill"}
 
 
 def main() -> None:

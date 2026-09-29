@@ -1,21 +1,26 @@
 # Qwen3.5-2B on the Metal backend: accuracy and speed (bf16 / INT8 / INT4)
 
 The final model: 24 layers (18 Gated DeltaNet + 6 gated attention), hidden 2048, vocabulary 248,320, tied
-embedding. MacBook Air M2 (8-core GPU), 8 GB. Code at commit `f9280fa`. Raw output: `docs/bench/raw/ours_2b_*.md`,
-`docs/bench/raw/accuracy_2b_vs_hf_bf16.txt`, `docs/bench/raw/tests/test_qwen35_2b.txt`.
+embedding. MacBook Air M2 (8-core GPU), 8 GB. Speed: code at commit `f9280fa` (raw:
+`docs/bench/raw/ours_2b_*.md`). Accuracy: re-run on the server-gap code (raw: `docs/bench/raw/tests/test_qwen35_2b.txt`;
+the `f9280fa` run, with the same KL, flips and greedy counts and a bf16 near-tie gap of 0.015, is
+`docs/bench/raw/accuracy_2b_vs_hf_bf16.txt`).
 
 ## Accuracy vs Hugging Face (tests/test_qwen35_2b.py)
 
 An fp32 reference would need ~7.5 GB for the weights alone, so the answer key is HF `transformers` in **bf16**
 (eager attention), on 7 prompts of 2–126 tokens (including Hindi; the 126-token prompt crosses the 64-token
-DeltaNet chunk boundary, the 57-token one comes close). Our engine computes decode and short prompts in fp32
-activations; bf16 weights are multiplied in bf16 by MPS for prompts longer than 32 tokens. "Flips" count top-1
+DeltaNet chunk boundary, the 57-token one comes close). Our engine computes in fp32 activations. (Until the
+server-gap work, bf16 weights were multiplied in bf16 by MPS for prompts longer than 32 tokens; they are now
+expanded to fp32 in row chunks, so packing a prompt with others changes its logits only by fp32 rounding, ≤ 2.9e-5
+in `tests/test_prefill.py`. The table was re-run on that code: only the bf16 divergence gap moved, 0.015 → 0.019
+logits.) "Flips" count top-1
 changes at positions where the reference's top-2 gap is above 0.5 logits (outside bf16 noise). "Greedy tokens
 equal" sums, over the 7 prompts, the generated tokens that match HF before the first divergence (10 per prompt).
 
 | weights | resident | KL vs HF bf16 | top-1 flips | greedy tokens equal to HF | continuation of "The capital of France is" |
 |---|---:|---:|---:|---:|---|
-| bf16 | 3.76 GB | 0.0004 | 0 / 190 | 64 / 70 (one divergence, where our top-2 gap is 0.015 logits) | Paris.\nA. True |
+| bf16 | 3.76 GB | 0.0004 | 0 / 190 | 64 / 70 (one divergence, where our top-2 gap is 0.019 logits) | Paris.\nA. True |
 | INT8 (block 32) | 2.00 GB | 0.0007 | 0 / 190 | 70 / 70 | Paris.\nA. True |
 | INT4 (asymmetric, block 32, 5 tensors + head INT8) | 1.41 GB | 0.045 | 3 / 190 | 47 / 70 (three divergences, where our top-2 gaps are 0.04–0.11 logits) | Paris. The capital of the |
 

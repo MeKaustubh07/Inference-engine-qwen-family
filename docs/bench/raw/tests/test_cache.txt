@@ -9,7 +9,7 @@ PASS  prompt 1: cached greedy == HF greedy (all 10 tokens)
 PASS  prompt 2: cached greedy == HF greedy (all 10 tokens)
 PASS  prompt 3: cached greedy == HF greedy (all 10 tokens)
 PASS  prompt 4: cached greedy == HF greedy (all 10 tokens)
-      CPU fp32, 32 tokens: no cache 3.56s (9.0 tok/s)  |  cache 2.76s (11.6 tok/s)  -> 1.3x
+      CPU fp32, 32 tokens: no cache 3.25s (9.9 tok/s)  |  cache 1.39s (23.1 tok/s)  -> 2.3x
 PASS  cached and uncached produce the same 32 tokens
 PASS  cache is faster
 PASS  KV cache bytes = 122880 for 5 tokens (24576 B/token in fp32, 12288 in bf16)

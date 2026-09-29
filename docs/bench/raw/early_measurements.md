@@ -71,12 +71,13 @@ wrote models/qwen3.5-2b/model.int8.qt: 2.00 GB of tensor data    55.46 s real   
 The batch-8 `decode_batch` step before the speed-up was timed twice: first 185.9 ms (single-linear experiment run),
 then 188.6 ms (the linears/rest split). Docs quote "186–189 ms".
 
-## An earlier run of tests/test_server.py (same code as the archived one)
+## An earlier run of tests/test_server.py (W17 code, same as the W17 archived run)
 
 ```
 PASS  real uvicorn: a non-streaming request whose client gave up is cancelled (29 of 400 tokens made), blocks freed
 ```
-The archived run (`tests/test_server.txt`) printed 43 of 400.
+The W17 archived run printed 43 of 400; the re-run on the server-gap code now archived in `tests/test_server.txt`
+(2026-09-30) printed 45.
 
 ## Container smoke tests (2026-09-28, transcribed from the session)
 

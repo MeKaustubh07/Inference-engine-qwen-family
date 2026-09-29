@@ -13,6 +13,7 @@ import ops
 from backend.torch_ref import TorchBackend
 from config import Qwen35Config
 from quant import QuantTensor, concat_rows
+from models.packing import Segment, advance_all, pack, reserve_all
 from state import ContiguousKVCache, HybridPool, HybridState, PagedKVPool, PagedSequence
 
 P = "model.language_model."
@@ -96,15 +97,16 @@ class Qwen35Model:
                                 self.weights.get(P + p + "v_proj.weight"), _rows(wq, rows[:, 1].flatten())])
         return self._fused(p + "qkvg.weight", build)
 
-    def full_attention(self, i: int, x, positions, state: HybridState | None, start: int, residual):
+    def full_attention(self, i: int, x, positions, segs: list[Segment], residual):
+        """x: [N, hidden], the tokens of every segment. Projections run once over all N; attention per segment."""
         c, b = self.config, self.b
         p = f"layers.{i}.self_attn."
-        T, Hq, Hkv, d = x.shape[0], c.num_attention_heads, c.num_key_value_heads, c.head_dim
+        N, Hq, Hkv, d = x.shape[0], c.num_attention_heads, c.num_key_value_heads, c.head_dim
 
         y = b.linear(x, self._qkvg(i))
-        q = y[:, : Hq * d].reshape(T, Hq, d)
-        k = y[:, Hq * d:(Hq + Hkv) * d].reshape(T, Hkv, d)
-        v = y[:, (Hq + Hkv) * d:(Hq + 2 * Hkv) * d].reshape(T, Hkv, d)
+        q = y[:, : Hq * d].reshape(N, Hq, d)
+        k = y[:, Hq * d:(Hq + Hkv) * d].reshape(N, Hkv, d)
+        v = y[:, (Hq + Hkv) * d:(Hq + 2 * Hkv) * d].reshape(N, Hkv, d)
         gate = y[:, (Hq + 2 * Hkv) * d:]
         q = b.rms_norm(q, self._vec(p + "q_norm.weight", one_plus=True), c.rms_norm_eps)   # per head, before RoPE
         k = b.rms_norm(k, self._vec(p + "k_norm.weight", one_plus=True), c.rms_norm_eps)
@@ -112,50 +114,60 @@ class Qwen35Model:
         qk = b.rope(torch.cat([q[..., :r], k[..., :r]], dim=1).contiguous(), positions, c.rope_theta)
         q = torch.cat([qk[:, :Hq], q[..., r:]], dim=-1)
         k = torch.cat([qk[:, Hq:], k[..., r:]], dim=-1)
-        if state is not None:
-            slot = self.slot[i]
-            state.kv.write(slot, start, k, v)
-            k, v = state.kv.read(slot, start + T)
-        o = b.attention(q, k, v, causal=True).reshape(T, Hq * d)                           # scale 1/sqrt(256)
+        outs = []
+        for sg in segs:                                            # each sequence attends to its own history only
+            qs, ks, vs = q[sg.lo:sg.hi], k[sg.lo:sg.hi], v[sg.lo:sg.hi]
+            if sg.state is not None:
+                slot = self.slot[i]
+                sg.state.kv.write(slot, sg.start, ks, vs)
+                ks, vs = sg.state.kv.read(slot, sg.start + sg.hi - sg.lo)
+            outs.append(b.attention(qs, ks, vs, causal=True))                               # scale 1/sqrt(256)
+        o = (torch.cat(outs) if len(outs) > 1 else outs[0]).reshape(N, Hq * d)
         o = o * torch.sigmoid(gate)                                                         # output gate, BEFORE o_proj
         return b.linear(o, self._w(p + "o_proj.weight"), residual=residual)
 
-    def linear_attention(self, i: int, x, state: HybridState | None, residual):
+    def linear_attention(self, i: int, x, segs: list[Segment], residual):
+        """x: [N, hidden]. in_proj / out_proj run once over all N tokens; conv + delta rule per segment."""
         c, b = self.config, self.b
         p = f"layers.{i}.linear_attn."
-        T, H, dk, dv = x.shape[0], c.linear_num_value_heads, c.linear_key_head_dim, c.linear_value_head_dim
+        H, dk, dv = c.linear_num_value_heads, c.linear_key_head_dim, c.linear_value_head_dim
         names = ["in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"]
         y = b.linear(x, self._fused(p + "in_proj.weight",
                                     lambda: concat_rows([self.weights.get(P + p + n + ".weight") for n in names])))
-        qkv, z = y[:, : self.conv_dim], y[:, self.conv_dim:self.conv_dim + self.value_dim]
-        beta_logit, a = y[:, -2 * H:-H], y[:, -H:]
-
+        qkv_all, z_all = y[:, : self.conv_dim], y[:, self.conv_dim:self.conv_dim + self.value_dim]
+        beta_all, a_all = y[:, -2 * H:-H], y[:, -H:]
         slot = self.slot[i]
-        if T == 1 and state is not None:                          # decode: one fused step (kernels on Metal)
-            o = b.deltanet_decode(qkv, z, beta_logit, a, state, slot, self._vec(p + "conv1d.weight").squeeze(1),
-                                  self._vec(p + "A_log"), self._vec(p + "dt_bias"), self._vec(p + "norm.weight"),
-                                  c.rms_norm_eps, (H, dk, dv, self.key_dim))
-            return b.linear(o, self._w(p + "out_proj.weight"), residual=residual)
-        tail = state.conv_tail[slot] if state is not None else torch.zeros(c.linear_conv_kernel_dim - 1, self.conv_dim, device=b.device)
         conv_w = self._vec(p + "conv1d.weight").squeeze(1)                                  # [6144, 4]
-        u, new_tail = b.causal_conv1d(qkv, tail, conv_w)                                     # conv BEFORE the split
+        outs = []
+        for sg in segs:
+            T, state = sg.hi - sg.lo, sg.state
+            qkv, z, beta_logit, a = (t[sg.lo:sg.hi] for t in (qkv_all, z_all, beta_all, a_all))
+            if T == 1 and state is not None:                      # decode: one fused step (kernels on Metal)
+                outs.append(b.deltanet_decode(qkv, z, beta_logit, a, state, slot, conv_w, self._vec(p + "A_log"),
+                                              self._vec(p + "dt_bias"), self._vec(p + "norm.weight"), c.rms_norm_eps,
+                                              (H, dk, dv, self.key_dim)))
+                continue
+            tail = state.conv_tail[slot] if state is not None else torch.zeros(c.linear_conv_kernel_dim - 1, self.conv_dim, device=b.device)
+            u, new_tail = b.causal_conv1d(qkv, tail, conv_w)                                 # conv BEFORE the split
 
-        q = u[:, : self.key_dim].reshape(T, H, dk)
-        k = u[:, self.key_dim:2 * self.key_dim].reshape(T, H, dk)
-        v = u[:, 2 * self.key_dim:].reshape(T, H, dv)
-        beta = torch.sigmoid(beta_logit.float())
-        ab = a.float() + self._vec(p + "dt_bias")
-        g = -torch.exp(self._vec(p + "A_log")) * torch.where(ab > 20, ab, torch.log1p(torch.exp(ab)))   # decay <= 0
-        q = ops.l2norm(q.float()) * (1.0 / math.sqrt(dk))
-        k = ops.l2norm(k.float())
+            q = u[:, : self.key_dim].reshape(T, H, dk)
+            k = u[:, self.key_dim:2 * self.key_dim].reshape(T, H, dk)
+            v = u[:, 2 * self.key_dim:].reshape(T, H, dv)
+            beta = torch.sigmoid(beta_logit.float())
+            ab = a.float() + self._vec(p + "dt_bias")
+            g = -torch.exp(self._vec(p + "A_log")) * torch.where(ab > 20, ab, torch.log1p(torch.exp(ab)))   # decay <= 0
+            q = ops.l2norm(q.float()) * (1.0 / math.sqrt(dk))
+            k = ops.l2norm(k.float())
 
-        S = state.S[slot] if state is not None else torch.zeros(H, dk, dv, device=b.device)
-        o, S = b.gated_delta(q, k, v.float(), beta, g, S)
-        if state is not None:
-            state.S[slot] = S
-            state.conv_tail[slot] = new_tail
-        o = b.rms_norm_gated(o.reshape(T * H, dv), z.reshape(T * H, dv), self._vec(p + "norm.weight"), c.rms_norm_eps)
-        return b.linear(o.reshape(T, H * dv), self._w(p + "out_proj.weight"), residual=residual)
+            S = state.S[slot] if state is not None else torch.zeros(H, dk, dv, device=b.device)
+            o, S = b.gated_delta(q, k, v.float(), beta, g, S)
+            if state is not None:
+                state.S[slot] = S
+                state.conv_tail[slot] = new_tail
+            o = b.rms_norm_gated(o.reshape(T * H, dv), z.reshape(T * H, dv), self._vec(p + "norm.weight"), c.rms_norm_eps)
+            outs.append(o.reshape(T, H * dv))
+        o = torch.cat(outs) if len(outs) > 1 else outs[0]
+        return b.linear(o, self._w(p + "out_proj.weight"), residual=residual)
 
     def mlp(self, i: int, x, residual):
         b, p = self.b, f"layers.{i}.mlp."
@@ -163,38 +175,50 @@ class Qwen35Model:
             [self.weights.get(P + p + "gate_proj.weight"), self.weights.get(P + p + "up_proj.weight")]))
         return b.linear(b.swiglu(x, w), self._w(p + "down_proj.weight"), residual=residual)
 
-    def block(self, i: int, h, positions, state, start: int):
+    def block(self, i: int, h, positions, segs: list[Segment]):
         c, b = self.config, self.b
         x = b.rms_norm(h, self._vec(f"layers.{i}.input_layernorm.weight", one_plus=True), c.rms_norm_eps)
         if c.layer_types[i] == "full_attention":
-            h = self.full_attention(i, x, positions, state, start, residual=h)
+            h = self.full_attention(i, x, positions, segs, residual=h)
         else:
-            h = self.linear_attention(i, x, state, residual=h)
+            h = self.linear_attention(i, x, segs, residual=h)
         x = b.rms_norm(h, self._vec(f"layers.{i}.post_attention_layernorm.weight", one_plus=True), c.rms_norm_eps)
         return self.mlp(i, x, residual=h)
+
+    def _layers(self, ids, positions, segs: list[Segment], capture: dict | None = None):
+        """Embedding and all layers over the packed tokens -> hidden states [N, hidden] (before the final norm)."""
+        reserve_all(segs)                            # fail before any layer mutates state (atomic forward)
+        h = self.embed(ids)
+        if capture is not None:
+            capture["embed"] = h
+        for i in range(self.config.num_hidden_layers):
+            h = self.block(i, h, positions, segs)
+            if capture is not None:
+                capture[f"l{i}_out"] = h
+        advance_all(segs)
+        return h
 
     def forward(self, ids: torch.Tensor, state: HybridState | None = None, last_only: bool = False,
                 capture: dict | None = None) -> torch.Tensor:
         """Token ids [T] -> logits [T, vocab]. With a state, continues from state.length and updates it."""
         start = state.length if state is not None else 0
-        if state is not None:
-            state.reserve(start + len(ids))          # fail before any layer mutates state (atomic forward)
         positions = torch.arange(start, start + len(ids), device=self.b.device, dtype=torch.int32)
-        h = self.embed(ids)
-        if capture is not None:
-            capture["embed"] = h
-        for i in range(self.config.num_hidden_layers):
-            h = self.block(i, h, positions, state, start)
-            if capture is not None:
-                capture[f"l{i}_out"] = h
-        if state is not None:
-            state.advance(len(ids))
+        h = self._layers(ids, positions, [Segment(0, len(ids), state, start)], capture)
         if last_only:
             h = h[-1:]
         h = self.b.rms_norm(h, self._vec("norm.weight", one_plus=True), self.config.rms_norm_eps)
         if capture is not None:
             capture["final_norm"] = h
         return self.b.linear(h, self._w("embed_tokens.weight"))                            # tied output head
+
+    def forward_packed(self, chunks: list[tuple[torch.Tensor, HybridState]]) -> torch.Tensor:
+        """Several sequences' chunks (each continuing its own state) in one pass -> logits of each chunk's last
+        token [len(chunks), vocab]. Same result as calling forward on each chunk, with each weight read once."""
+        ids, positions, segs = pack(chunks, self.b.device)
+        h = self._layers(ids, positions, segs)
+        last = torch.tensor([sg.hi - 1 for sg in segs]).to(self.b.device, non_blocking=True)
+        h = self.b.rms_norm(h[last], self._vec("norm.weight", one_plus=True), self.config.rms_norm_eps)
+        return self.b.linear(h, self._w("embed_tokens.weight"))
 
     def decode_batch(self, tokens: list[int], states: list) -> torch.Tensor:
         """One decode step for B independent sequences -> logits [B, vocab].

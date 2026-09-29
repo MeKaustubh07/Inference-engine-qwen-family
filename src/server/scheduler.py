@@ -1,10 +1,15 @@
 """Continuous-batching scheduler.
 
-One engine thread owns the GPU. Requests wait in a bounded queue (full -> QueueFull -> HTTP 429). Each loop:
-  1. admit waiting requests while there is a batch slot and enough free KV blocks, prefilling each one;
-  2. run ONE batched decode step for every running request (each weight read once for the whole batch);
-  3. stream each new token to its request; finished requests free their KV blocks immediately, so a waiting
-     request can take the slot on the very next step (no waiting for the whole batch to finish).
+One engine thread owns the GPU. Requests wait in a bounded queue (full -> QueueFull -> HTTP 429), then move
+waiting -> prefilling -> running. Each loop:
+  1. admit waiting requests while there is a batch slot and enough free KV blocks (their prompt blocks are
+     reserved now, so a prefill never runs out halfway);
+  2. run ONE packed prefill forward over at most `prefill_chunk` prompt tokens, taken first-come-first-served
+     from the prefilling requests: several short prompts share one pass over the weights, and a long prompt is
+     split into chunks across iterations (chunked prefill), so running requests are never stalled for long;
+  3. run ONE batched decode step for every running request (each weight read once for the whole batch);
+  4. sample the batch's next tokens in one batched pass and stream them; finished requests free their KV
+     blocks immediately, so a waiting request can take the slot on the very next step.
 If the KV pool runs dry mid-generation, the newest running request is preempted: its blocks are freed and it is
 re-queued to recompute its prefix later (vLLM-style recompute preemption); its client sees no gap in the text.
 """
@@ -17,7 +22,7 @@ from dataclasses import dataclass, field
 
 import torch
 
-from sampler import SamplingParams, sample
+from sampler import SamplingParams, sample, sample_batch
 from state import OutOfBlocks
 
 
@@ -38,6 +43,8 @@ class Request:
     prefix_offset: int = 0                                # incremental detokenization window (see _emit)
     read_offset: int = 0
     state: object = None
+    to_prefill: list[int] = field(default_factory=list)  # prompt (+ tokens made before a preemption) to prefill
+    prefill_pos: int = 0                                  # how many of them are already in the state
     first_token_at: float | None = None
     last_token_at: float | None = None
     generator: torch.Generator | None = None
@@ -47,21 +54,30 @@ class Request:
 
 class Scheduler:
     def __init__(self, engine, metrics, max_batch: int = 8, max_waiting: int = 64, kv_blocks: int = 1024,
-                 block_size: int = 16, max_model_len: int = 4096):
+                 block_size: int = 16, max_model_len: int = 4096, prefill_chunk: int = 512,
+                 batch_wait_ms: float = 5.0):
         if not 1 <= max_batch <= 32:                          # batched decode kernels cover up to 32 rows
             raise ValueError("max_batch must be between 1 and 32")
         self.eng, self.metrics = engine, metrics
         self.model, self.tok = engine.model, engine.tokenizer
+        if prefill_chunk < 1:
+            raise ValueError("prefill_chunk must be at least 1")
+        if not 0 <= batch_wait_ms <= 1000:                    # also rejects NaN and inf (a wait that long raises)
+            raise ValueError("batch_wait_ms must be between 0 and 1000")
         self.max_batch, self.max_waiting, self.max_model_len = max_batch, max_waiting, max_model_len
+        self.prefill_chunk = prefill_chunk
+        self.batch_wait = batch_wait_ms / 1e3
         self.pool = self.model.new_paged_pool(kv_blocks, block_size, max_seqs=max(max_batch, 2))
         self.block_size = block_size
         self.waiting: collections.deque[Request] = collections.deque()
-        self.running: list[Request] = []
+        self.prefilling: list[Request] = []                  # admitted, prompt partly in the state
+        self.running: list[Request] = []                     # decoding
         self.active: set[Request] = set()                     # submitted and not finished (waiting, prefilling, running)
         self.cond = threading.Condition()
         self.accepting = True
         self._stop = False
         self._ids = itertools.count()
+        self._arrivals = 0                                    # submitted so far: the batching window counts these
         self._warmup()
         metrics.set("kv_blocks_total", kv_blocks)
         metrics.set("kv_blocks_free", self.pool.allocator.num_free)
@@ -72,8 +88,7 @@ class Scheduler:
         """Page in every weight and build every fused/quantized tensor before /ready says yes (weights load lazily),
         through both the single-sequence and the batched decode paths. Fails fast on a bad model/backend combo."""
         states = [self.model.new_paged_state(self.pool) for _ in range(2)]
-        for st in states:
-            self.model.forward(torch.tensor([0]), state=st, last_only=True)
+        self.model.forward_packed([(torch.tensor([0]), st) for st in states])
         self.model.decode_batch([0, 0], states)
         for st in states:
             st.free()
@@ -97,6 +112,7 @@ class Scheduler:
                 raise QueueFull("server busy")
             self.waiting.append(req)
             self.active.add(req)
+            self._arrivals += 1
             self.metrics.inc("requests_total")
             self.metrics.inc("prompt_tokens_total", len(prompt_ids))
             self.cond.notify()
@@ -135,47 +151,108 @@ class Scheduler:
     def _loop(self) -> None:
         while True:
             with self.cond:
-                while not self._stop and not self.waiting and not self.running:
+                idle = not self.prefilling and not self.running
+                while not self._stop and not self.waiting and not self.prefilling and not self.running:
                     self.cond.wait()
                 if self._stop:
                     return
+                if idle and self.batch_wait:
+                    self._gather()
             try:
                 self._admit()
+                if self.prefilling:
+                    self._prefill_step()
                 if self.running:
                     self._decode_step()
             except Exception as e:                            # never let one bad step kill the server
-                for r in list(self.running):
+                for r in list(self.prefilling) + list(self.running):
                     self._finish(r, "error", str(e))
             self._update_gauges()
+
+    def _gather(self) -> None:
+        """Called with the lock held when an idle engine has just been handed work: keep collecting arrivals while
+        they come within `batch_wait` of each other (at most 2 x batch_wait in total), so requests that arrive
+        together (clients whose requests all finished on the same step) share one packed prefill pass instead of
+        the first one being prefilled alone. A lone request waits at most `batch_wait`."""
+        deadline = time.perf_counter() + 2 * self.batch_wait
+        while not self._stop and len(self.waiting) < self.max_batch:
+            before = self._arrivals                           # arrivals, not queue length: a cancel is not one
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                return
+            self.cond.wait(min(self.batch_wait, remaining))
+            if self._arrivals == before:
+                return                                        # nothing arrived within batch_wait: go
 
     def _blocks_for(self, n_tokens: int) -> int:
         return -(-n_tokens // self.block_size)
 
     def _admit(self) -> None:
+        """Move waiting requests to prefilling while there is a batch slot, a state slot and room in the KV pool.
+        No compute here: the prompt's blocks are reserved and the prefill happens in chunks (_prefill_step)."""
         while True:
             with self.cond:
-                if not self.waiting or len(self.running) >= self.max_batch:
+                in_flight = len(self.running) + len(self.prefilling)
+                if not self.waiting or in_flight >= self.max_batch:
                     return
                 req = self.waiting[0]
                 if req.cancelled:
                     self.waiting.popleft(); self._finish(req, "cancelled"); continue
                 ids = req.prompt_ids + req.generated          # a preempted request recomputes what it produced
-                # headroom: keep one free block per running sequence, since each may cross a block boundary on the
-                # next step; otherwise the newcomer would be preempted right away and its prefill wasted
-                if self._blocks_for(len(ids) + 1) + len(self.running) > self.pool.allocator.num_free:
+                # headroom: keep one free block per sequence in flight, since each may cross a block boundary on
+                # its next step; otherwise the newcomer would be preempted right away and its prefill wasted
+                if self._blocks_for(len(ids) + 1) + in_flight > self.pool.allocator.num_free:
                     return                                    # wait for running requests to free blocks
                 if not getattr(self.pool, "free_seqs", True):
                     return                                    # hybrid models: wait for a DeltaNet state slot too
                 self.waiting.popleft()
             try:
                 req.state = self.model.new_paged_state(self.pool)
-                logits = self.model.forward(torch.tensor(ids), state=req.state, last_only=True)[0]
-                token = self._sample(req, logits[: self.tok.vocab_size()].float().cpu())
+                req.state.reserve(len(ids))                   # every prompt block now: chunks can never run out
             except Exception as e:                            # fail this request, not the server
-                self._finish(req, "error", f"prefill failed: {e}")
+                self._finish(req, "error", f"admission failed: {e}")
                 continue
-            self.running.append(req)
-            self._emit(req, token)                            # first token (or, after preemption, the next one)
+            req.to_prefill, req.prefill_pos = ids, 0
+            self.prefilling.append(req)
+
+    def _prefill_step(self) -> None:
+        """One packed forward over the next chunks of the prefilling requests (first come, first served), at most
+        `prefill_chunk` tokens in total. Requests whose whole prompt is now in their state get their first token."""
+        for r in [r for r in self.prefilling if r.cancelled]:   # all of them, not only those the budget reaches:
+            self._finish(r, "cancelled")                       # their blocks and slots free up on this step
+        chunks, taken, budget = [], [], self.prefill_chunk
+        for r in self.prefilling:
+            if budget == 0:
+                break
+            n = min(len(r.to_prefill) - r.prefill_pos, budget)
+            chunks.append((torch.tensor(r.to_prefill[r.prefill_pos:r.prefill_pos + n]), r.state))
+            taken.append((r, n))
+            budget -= n
+        if not chunks:
+            return
+        try:
+            logits = self.model.forward_packed(chunks)
+        except Exception as e:                                # fail these requests, not the server
+            for r, _ in taken:
+                self._finish(r, "error", f"prefill failed: {e}")
+            return
+        self.metrics.inc("prefill_steps_total")
+        self.metrics.inc("prefill_tokens_total", sum(n for _, n in taken))
+        done = []
+        for row, (r, n) in enumerate(taken):
+            r.prefill_pos += n
+            if r.prefill_pos == len(r.to_prefill):
+                done.append((row, r))
+        if not done:
+            return
+        for _, r in done:
+            self.prefilling.remove(r)
+        tokens = self._sample_rows([r for _, r in done], logits[[row for row, _ in done]])
+        for (_, r), token in zip(done, tokens):
+            if token is None:
+                continue                                      # sampling failed: already finished with an error
+            self.running.append(r)
+            self._emit(r, token)                              # first token (or, after preemption, the next one)
 
     def _decode_step(self) -> None:
         active = [r for r in self.running if r.finish_reason is None]
@@ -193,18 +270,37 @@ class Scheduler:
         logits = self.model.decode_batch([r.generated[-1] for r in active], [r.state for r in active])
         self.metrics.inc("decode_steps_total")
         self.metrics.inc("decode_sequences_total", len(active))
-        logits = logits[:, : self.tok.vocab_size()].float().cpu()      # one device->host copy for the batch
-        for r, lg in zip(active, logits):
-            try:
-                token = self._sample(r, lg)
-            except Exception as e:                            # a bad request fails alone, not its batch-mates
-                self._finish(r, "error", f"sampling failed: {e}")
-                continue
-            self._emit(r, token)
+        for r, token in zip(active, self._sample_rows(active, logits)):
+            if token is not None:
+                self._emit(r, token)
 
-    def _sample(self, req: Request, logits: torch.Tensor) -> int:
-        """logits: [vocab] on the CPU, padding ids already sliced off."""
-        return sample(logits, req.prompt_ids + req.generated, req.params, req.generator)
+    def _sample_rows(self, reqs: list[Request], logits: torch.Tensor) -> list[int | None]:
+        """Next token for each request from its row of logits, in one batched pass (the penalty and the top-k
+        selection run once for the whole batch; see sampler.sample_batch). A request whose row cannot be sampled
+        is finished with an error (None returned for it); its batch-mates go on unaffected."""
+        V = self.tok.vocab_size()
+        prev = [r.prompt_ids + r.generated for r in reqs]
+        try:
+            # on the CPU: with unified memory, copying a batch-8 of 248k logits takes ~0.5 ms, and torch.topk over
+            # them takes 1.0 ms there vs 4.5 ms on MPS (docs/bench/raw/profiling.md section 9). Copy, then slice off
+            # the padded vocabulary rows: copying the strided slice costs twice as much
+            tokens = sample_batch(logits.float().cpu()[:, :V], prev, [r.params for r in reqs],
+                                  [r.generator for r in reqs])
+        except Exception:                                     # the copy or the batch-wide selection failed, before
+            tokens = []                                       # any generator was drawn from: safe to go row by row
+            for r, row, p in zip(reqs, logits, prev):
+                try:
+                    tokens.append(sample(row[:V].float().cpu(), p, r.params, r.generator))
+                except Exception as e:
+                    tokens.append(e)
+        out = []
+        for r, t in zip(reqs, tokens):
+            if isinstance(t, Exception):
+                self._finish(r, "error", f"sampling failed: {t}")
+                out.append(None)
+            else:
+                out.append(t)
+        return out
 
     def _emit(self, req: Request, token: int) -> None:
         now = time.perf_counter()
@@ -252,6 +348,8 @@ class Scheduler:
             req.state = None
         if req in self.running:
             self.running.remove(req)
+        if req in self.prefilling:
+            self.prefilling.remove(req)
         self.active.discard(req)
         req.out.put(("error", error) if error else ("done", reason))
         self.metrics.inc("requests_finished_total")
@@ -260,5 +358,6 @@ class Scheduler:
 
     def _update_gauges(self) -> None:
         self.metrics.set("running_requests", len(self.running))
+        self.metrics.set("prefilling_requests", len(self.prefilling))
         self.metrics.set("waiting_requests", len(self.waiting))
         self.metrics.set("kv_blocks_free", self.pool.allocator.num_free)

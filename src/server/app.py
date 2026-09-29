@@ -114,10 +114,10 @@ class OutputFilter:
 
 
 def create_app(engine, max_batch: int = 8, max_waiting: int = 64, kv_blocks: int = 1024, max_model_len: int = 4096,
-               drain_timeout: float = 2.0) -> FastAPI:
+               drain_timeout: float = 2.0, prefill_chunk: int = 512, batch_wait_ms: float = 5.0) -> FastAPI:
     metrics = Metrics()
     sched = Scheduler(engine, metrics, max_batch=max_batch, max_waiting=max_waiting, kv_blocks=kv_blocks,
-                      max_model_len=max_model_len)
+                      max_model_len=max_model_len, prefill_chunk=prefill_chunk, batch_wait_ms=batch_wait_ms)
 
     @contextlib.asynccontextmanager
     async def lifespan(_app):

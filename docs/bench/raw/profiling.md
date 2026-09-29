@@ -109,3 +109,101 @@ Expansion kernels are bit-identical to `QuantTensor.dequantize()` (fp32) and to 
 mlx_lm.generate "The capital of France is" -m 12 --temp 0: Generation 73.6 tok/s, peak memory 1.101 GB
 llama-bench Q4_1 -p 16 -n 8 (machine still busy): pp16 292 tok/s, tg8 53.1 tok/s
 ```
+
+## 7. Where a server decode step goes (2026-09-29, commit bbeb6c6, Qwen3.5-2B INT4, batch 8)
+
+Scheduler methods wrapped with wall-clock timers; `decode_batch` followed by `torch.mps.synchronize()` to split
+issue time from GPU time. In-process = requests submitted straight to the Scheduler; HTTP = the real app under
+uvicorn driven by scripts/loadgen.py at concurrency 8.
+```
+                                    in-process   HTTP
+batch-8 decode step, mean             79.4 ms   84.1 ms
+  decode_batch: issue (CPU)            3.8       4.1
+  decode_batch: GPU wait               67.3      69.2
+  sample (CPU, per request)             6.9       8.8
+  emit (detokenize + hand-off)          0.2       0.2
+  rest (logits .cpu(), bookkeeping)     1.2       1.7
+admit/prefill over the run            5.7 s     5.6 s   (16 prompts of 19-24 tokens, one at a time)
+```
+There is no unexplained per-step overhead: the gap to the engine-only numbers was prefill, done one prompt at a
+time inside the loop (~0.35 s each under load) while every running request waited.
+
+## 8. Prefill time vs prompt length, one forward (same commit)
+
+```
+prefill T=1: 25.9 ms   T=8: 122.3   T=16: 175.3   T=23: 222.0   T=32: 292.1   T=33: 255.4
+        T=64: 267.4    T=128: 394.2   T=184: 542.0   T=256: 676.3
+all 96 quantized linears (no head) at M=8: 49.4 ms  M=23: 146.5  M=32: 203.3  M=33: 183.6  M=64: 193.5  M=184: 336.4
+```
+8 chat prompts of ~23 tokens: one at a time 8 x 222 = ~1.8 s; packed into one 184-token forward 0.54 s.
+
+## 9. After packed + chunked prefill, the batching window and batched sampling (2026-09-29, same model)
+
+Batched sampling, first placed on the GPU (`bench_sample`: random logits [8, 248320] on MPS, API-default params
+temperature 0.7 / top-k 20 / top-p 0.8, medians of 30-40 synced repeats):
+```
+torch.topk on MPS, 8 x 248320:   k=1 4.53 ms  k=8 4.55  k=16 4.56  k=17 4.56  k=28 4.56  k=64 4.55
+torch.topk on CPU, 8 x 248320:   k=1 1.04 ms  k=8 1.04  k=16 1.03  k=17 1.03  k=28 1.03  k=64 1.05   (4 threads)
+copy the batch's logits to the CPU: 0.48 ms (whole tensor), 0.99 ms (the [:, :248070] strided slice)
+old per-row sampler (copy + sample() per row):  6.65 ms   (6.87 with repetition_penalty 1.1)
+sample_batch on MPS logits:                     5.31-7.26 ms (two runs)   (7.87 with repetition_penalty 1.1)
+sample_batch(logits.cpu()), copy included:     2.22 ms   (3.02 with repetition_penalty 1.1)
+```
+MPS top-k costs ~4.5 ms whatever k is, 4x the CPU's; with unified memory the copy is nearly free. So the batched
+selection runs on the CPU; the logits are copied whole and sliced after.
+
+Where a batch-8 decode step goes (harness as in section 7, 2 waves of 8 x 64 tokens in-process; the HTTP line is
+the real app under loadgen at concurrency 8):
+```
+                                   before        after, sampling on MPS      after, CPU sampling
+                                   in-process    in-process   HTTP           in-process
+batch-8 decode step, mean            79.4 ms       78.7 ms    81.0 ms          73.3 ms
+  decode_batch: issue (CPU)           3.8           7.8        9.7              4.2
+  decode_batch: GPU wait              67.3          63.4       62.1             65.8
+  sample                               6.9           7.2        8.4              3.2
+  emit                                 0.2           0.3        0.6              0.1
+  rest                                 1.2           0.1        0.2              0.0
+throughput per wave                                81.7 / 88.1                  86.1 / 93.3 tok/s
+```
+An intermediate CPU version that copied the strided [:, :vocab] slice measured 75.4 ms per step, 4.7 ms of it
+sampling. The issue/GPU split moves with CPU load (the GPU starts while Python is still issuing); their sum is
+~70-73 ms in every column. The "before" column is section 7's. The review fixes that came after the last column
+(window arrival counting, batch_wait bounds, the sampling fallback's structure) do not touch the decode step or
+the prefill pass.
+
+Packed prefill passes (CPU-sampling version, in-process, each wave = 8 chat prompts, 175 tokens, synced):
+```
+wave 0: 1,332 ms (first pass of this size)   wave 1: 820 ms
+```
+vs 8 x ~222 ms = ~1.8 s one prompt at a time, and 542 ms for a single 184-token prompt (section 8): attention and
+the DeltaNet recurrence run per packed sequence, ~40 ms per extra sequence at this size ((820 - 542) / 7).
+
+One request at a time (in-process, 8 prompts x 2 rounds after a warm-up round, 2 tokens each):
+```
+                              before     after (MPS-sampling version, window before the review fix;
+                                         a lone request waits one 5 ms window in both)
+TTFT mean                     220.4 ms   222.9 ms
+  batching window (gather)       -         6.2 ms
+  prefill forward (synced)    218.1       214.5
+  sampling, per call            1.7         1.7
+```
+
+## 10. The 2026-09-28 run's "108-110 ms per token" did not reproduce
+
+Per-token time of the last-admitted request in each of the two 8-client waves ((latency - TTFT) / 63, from each
+server's `request_finished` log lines; every wave arrived and finished together, so those 63 tokens had no prefill
+in between):
+```
+2026-09-28 published run (raw/server_request_log_final.jsonl)   107.8 / 109.9 ms
+same code, re-measured 2026-09-29/30 (kept runs):
+  2026-09-29 baseline runs 1 and 2 (loadgen_2b_int4_2026-09-29_before_run*)  77.7 / 78.1,  82.7 / 81.9
+  A/B 1 block 1 runs 1 and 4                                      79.6 / 82.4,  89.2 / 90.4
+  A/B 1 block 2 run 2                                              80.5 / 81.1
+  final A/B runs 1, 4, 6, 7                                        78.1 / 78.4,  78.7 / 78.0,  80.2 / 77.8,  77.0 / 77.7
+  (excluded runs: 119.2 / 144.5 and 238.4 / 175.5)
+final code, final A/B runs 2, 3, 5, 8                            72.5 / 72.7,  72.9 / 72.6,  72.2 / 72.2,  71.9 / 72.5
+```
+So the ~28 ms per step blamed on "unprofiled engine-loop work" belonged to that run, which was slower in every
+step (cause not established; its throughput, 55.9 tok/s at 8 clients, is the same outlier). In the re-measured
+runs the gap to the engine's 116 tok/s (104 vs 69 ms per 8 tokens) is ~20 ms of one-at-a-time prefill and ~15 ms
+of per-step work around decode_batch (section 7).

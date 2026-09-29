@@ -4,6 +4,7 @@ import torch
 from backend.torch_ref import TorchBackend
 from config import ModelConfig
 from quant import concat_rows
+from models.packing import Segment, advance_all, pack, reserve_all
 from state import ContiguousKVCache, PagedKVPool, PagedSequence
 from weight_loader import SafetensorsFile
 
@@ -50,7 +51,7 @@ class Qwen2Model:
 
     def self_attn(self, layer: int, x: torch.Tensor, positions: torch.Tensor | None = None,
                   state: ContiguousKVCache | None = None, residual: torch.Tensor | None = None,
-                  start: int | None = None) -> torch.Tensor:
+                  start: int | None = None, segs: list[Segment] | None = None) -> torch.Tensor:
         """Attention half of one station. x: normalized stream [T, hidden] -> [T, hidden].
 
         positions: absolute positions of the T tokens (default 0..T-1).
@@ -59,6 +60,7 @@ class Qwen2Model:
         residual:  if given, added inside the output projection (fused residual connection).
         start:     first position as a plain int. Pass it whenever you can: reading it back from a GPU
                    tensor (int(positions[0])) forces the CPU to wait for all queued GPU work.
+        segs:      packed prefill: the sequences whose tokens x holds (then state/start are ignored).
         """
         cfg, b = self.config, self.b
         p = f"model.layers.{layer}.self_attn."
@@ -81,14 +83,20 @@ class Qwen2Model:
         qk = b.rope(torch.cat([q, k], dim=1), positions, cfg.rope_theta)
         q, k = qk[:, :Hq], qk[:, Hq:]
 
-        # 4. KV cache: store the new keys/values, then attend over everything cached so far
-        if state is not None:
-            if start is None:
+        # 4. KV cache: store the new keys/values, then attend over everything cached so far. In a packed prefill
+        #    x holds several sequences' tokens; each segment attends to its own history only.
+        if segs is None:
+            if state is not None and start is None:
                 start = int(positions[0])                          # host sync; forward() passes start instead
-            state.write(layer, start, k, v)
-            k, v = state.read(layer, start + T)
-
-        out = b.attention(q, k, v, causal=True)                   # [T, 14, 64]
+            segs = [Segment(0, T, state, start or 0)]
+        outs = []
+        for sg in segs:
+            qs, ks, vs = q[sg.lo:sg.hi], k[sg.lo:sg.hi], v[sg.lo:sg.hi]
+            if sg.state is not None:
+                sg.state.write(layer, sg.start, ks, vs)
+                ks, vs = sg.state.read(layer, sg.start + sg.hi - sg.lo)
+            outs.append(b.attention(qs, ks, vs, causal=True))     # [T, 14, 64]
+        out = torch.cat(outs) if len(outs) > 1 else outs[0]
         return b.linear(out.reshape(T, -1), self._w(p + "o_proj.weight"), residual=residual)   # no bias
 
     def mlp(self, layer: int, x: torch.Tensor, residual: torch.Tensor | None = None) -> torch.Tensor:
@@ -99,12 +107,22 @@ class Qwen2Model:
         return b.linear(hidden, self._w(p + "down_proj.weight"), residual=residual)
 
     def block(self, layer: int, h: torch.Tensor, positions: torch.Tensor | None = None,
-              state: ContiguousKVCache | None = None, start: int | None = None) -> torch.Tensor:
+              state: ContiguousKVCache | None = None, start: int | None = None,
+              segs: list[Segment] | None = None) -> torch.Tensor:
         """One full station: pre-norm attention and pre-norm MLP, each added back into the residual stream."""
         eps, b, p = self.config.rms_norm_eps, self.b, f"model.layers.{layer}."
         h = self.self_attn(layer, b.rms_norm(h, self._w(p + "input_layernorm.weight"), eps), positions, state,
-                           residual=h, start=start)
+                           residual=h, start=start, segs=segs)
         h = self.mlp(layer, b.rms_norm(h, self._w(p + "post_attention_layernorm.weight"), eps), residual=h)
+        return h
+
+    def _layers(self, ids: torch.Tensor, positions: torch.Tensor, segs: list[Segment]) -> torch.Tensor:
+        """Embedding and all layers over the packed tokens -> hidden states [N, hidden] (before the final norm)."""
+        reserve_all(segs)                            # fail before any layer mutates state (atomic forward)
+        h = self.embed(ids)
+        for layer in range(self.config.num_hidden_layers):
+            h = self.block(layer, h, positions, segs=segs)
+        advance_all(segs)
         return h
 
     def forward(self, ids: torch.Tensor, state: ContiguousKVCache | None = None,
@@ -115,18 +133,21 @@ class Qwen2Model:
         With a state, the tokens continue from state.length and their keys/values are cached.
         """
         start = state.length if state is not None else 0
-        if state is not None:
-            state.reserve(start + len(ids))          # fail before any layer mutates state (atomic forward)
         positions = torch.arange(start, start + len(ids), device=self.b.device, dtype=torch.int32)
-        h = self.embed(ids)
-        for layer in range(self.config.num_hidden_layers):
-            h = self.block(layer, h, positions, state, start)
-        if state is not None:
-            state.advance(len(ids))
+        h = self._layers(ids, positions, [Segment(0, len(ids), state, start)])
         if last_only:
             h = h[-1:]
         h = self.b.rms_norm(h, self._w("model.norm.weight"), self.config.rms_norm_eps)
         # Tied embeddings: the table that turned ids into vectors now scores vectors against every token.
+        return self.b.linear(h, self._w("model.embed_tokens.weight"))
+
+    def forward_packed(self, chunks: list[tuple[torch.Tensor, object]]) -> torch.Tensor:
+        """Several sequences' chunks (each continuing its own state) in one pass -> logits of each chunk's last
+        token [len(chunks), vocab]. Same result as calling forward on each chunk, with each weight read once."""
+        ids, positions, segs = pack(chunks, self.b.device)
+        h = self._layers(ids, positions, segs)
+        last = torch.tensor([sg.hi - 1 for sg in segs]).to(self.b.device, non_blocking=True)
+        h = self.b.rms_norm(h[last], self._w("model.norm.weight"), self.config.rms_norm_eps)
         return self.b.linear(h, self._w("model.embed_tokens.weight"))
 
     def decode_batch(self, tokens: list[int], states: list) -> torch.Tensor:

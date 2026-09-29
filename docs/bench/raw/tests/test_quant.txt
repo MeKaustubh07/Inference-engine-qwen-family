@@ -13,13 +13,13 @@ PASS  int4 matvec 896x4864 (+residual) vs dequantized reference: rel diff 2.6e-0
 PASS  policy groups: Qwen2 and Qwen3.5 component and fused names map to one group id
 PASS  a kept fused tensor keeps ALL its components int8 (q, k, v)
 PASS  .qt round trip: quantized weight bit-identical (data, scales, mins), norm kept as bf16
-      bf16 : weights 0.99 GB | perplexity 11.336 | KL vs fp32 0.0000 | top-1 agreement 100% | greedy ' Paris. It is the largest city in Europe and'
+      bf16 : weights 0.99 GB | perplexity 11.350 | KL vs fp32 0.0000 | top-1 agreement 100% | greedy ' Paris. It is the largest city in Europe and'
       int8 : weights 0.52 GB | perplexity 11.301 | KL vs fp32 0.0193 | top-1 agreement 98% | greedy ' Paris. It is the largest city in Europe and'
       int4 : weights 0.37 GB | perplexity 11.495 | KL vs fp32 1.8453 | top-1 agreement 64% | greedy ' Paris. Paris is the capital of which country?\n'
       int4+policy: weights 0.41 GB | perplexity 11.204 | KL vs fp32 0.1143 | top-1 agreement 94% | greedy ' Paris. Paris is the capital of France. Paris'
 PASS  .qt-loaded int4 model == on-the-fly int4 model (identical logits)
-PASS  int8 perplexity within 1% of bf16 (11.301 vs 11.336)
-PASS  int4 (asymmetric, int8 embedding) perplexity within 5% of bf16 (11.495 vs 11.336)
+PASS  int8 perplexity within 1% of bf16 (11.301 vs 11.350)
+PASS  int4 (asymmetric, int8 embedding) perplexity within 5% of bf16 (11.495 vs 11.350)
 PASS  int8 greedy output identical to bf16
 PASS  int4 still answers Paris
 PASS  calibrated int4 (sensitive tensors kept int8): KL vs fp32 0.114 < 0.15 and top-1 agreement 94% >= 90%

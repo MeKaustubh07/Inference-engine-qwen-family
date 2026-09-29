@@ -6,7 +6,11 @@ tokens each, API-default sampling (temperature 0.7, top-k 20, top-p 0.8, fixed s
 GPU), 8 GB.
 Raw: `docs/bench/raw/loadgen_2b_int4_*.md`, `metrics_after_final_loadtest.txt`, `server_request_log_final.jsonl`.
 
-## Result: first server vs final
+**Latest (2026-09-30): 94.3 tok/s at 8 clients, TTFT p50 0.84 s**, after profiling the server and adding packed +
+chunked prefill, a batching window and batched sampling; measured side by side with the previous server at
+77.0 tok/s ([Closing the gap](#closing-the-gap-profile-packed--chunked-prefill-batched-sampling)).
+
+## Result: first server vs the batching speed-up (commit f9280fa)
 
 | clients | throughput: first → final | TTFT p50 / p95: first → final | TPOT p50: first → final | e2e p50: first → final |
 |---:|---:|---:|---:|---:|
@@ -51,10 +55,10 @@ from it: 30 tok/s with 1 client, 31 with 8. Profiling one batch-8 step of `decod
    at 1.4 TFLOPS vs 2.5 for fp32) brought it to 0.65 s. The load test's chat prompts are 19–24 tokens, which go
    through the batched matvec kernels (up to 32 rows), not this path.
 
-## Why the server scales less than the raw engine
+## Why the server scaled less than the raw engine (first analysis; corrected by the profile below)
 
-The engine alone produces 116 tok/s at batch 8; the server delivers 56 tok/s with 8 clients. From the request
-log (`raw/server_request_log_final.jsonl`), three things add up:
+The engine alone produces 116 tok/s at batch 8; the server delivered 56 tok/s with 8 clients. From the request
+log (`raw/server_request_log_final.jsonl`), three things seemed to add up:
 - **Prefill bursts.** Every request produced exactly 64 tokens, so the 8 clients move in lockstep: each wave
   starts with 8 back-to-back prefills inside the engine loop (~0.29 s each: the last four requests of the final
   wave got their first token at 1.44, 1.73, 2.03 and 2.32 s), and no decode step runs meanwhile. Chunked prefill
@@ -68,6 +72,95 @@ log (`raw/server_request_log_final.jsonl`), three things add up:
 
 The TPOT median at 8 clients (126 ms) mixes the prefill bursts with this steady state.
 
+## Closing the gap: profile, packed + chunked prefill, batched sampling
+
+**The profile accounted for every millisecond of a step** (`raw/profiling.md` §7: the scheduler's methods wrapped
+with timers, `decode_batch` followed by a GPU synchronize to split issue time from GPU time). Under the HTTP load at
+8 clients a batch-8 decode step took 84.1 ms: 69.2 ms GPU, 4.1 ms issuing it from Python, 8.8 ms sampling, 0.2 ms
+emitting tokens, 1.7 ms the rest. **The "~28 ms" did not reproduce.** In the 2026-09-28 run each 8-client wave
+arrived and finished together, so the last-admitted request decoded its 63 tokens with no prefill in between, at
+108–110 ms per token: that was the run's steady state. Re-measuring the same code, the same request decoded at
+77–90 ms per token in 9 runs (`raw/profiling.md` §10). That run was slower in every step, the same unexplained
+slowness behind its 55.9 tok/s (last paragraph of this section). In the re-measured runs the gap to the engine's
+116 tok/s, 104 vs 69 ms per 8 tokens, splits into ~20 ms of prefill done one prompt at a time (~0.35 s each under
+load, 5.6 s over the run) while the wave's admitted requests waited, and ~15 ms of per-step work around
+`decode_batch`: 8.8 ms of sampling (not the ~12 estimated), ~4 ms of slower issue and GPU time under load, ~2 ms
+emit and the rest.
+
+**Prefill cost grows slowly with prompt length once the prompt is past 32 tokens** (`raw/profiling.md` §8): one
+forward of 23 tokens takes 222 ms, of 184 tokens 542 ms. Up to 32 rows the quantized linears run as batched
+matvec kernels that re-read every weight once per 8 rows (49.4 / 146.5 / 203.3 ms at 8 / 23 / 32 rows); above 32
+the weights are expanded to fp32 once per pass and multiplied by GEMM, which starts high and grows slowly (183.6 ms
+at 33 rows, 193.5 at 64, 336.4 at 184). Eight ~23-token chat prompts cost ~1.8 s one at a time; packed into one pass (item 1 below) they
+take 0.82 s (1.33 s the first time that size is seen; `raw/profiling.md` §9), more than a single 184-token prompt
+(0.54 s) because attention and the DeltaNet recurrence still run per sequence (~40 ms per extra sequence).
+
+What changed (`src/server/scheduler.py`, `src/models/packing.py`, `forward_packed` in `src/models/qwen3_5.py` and
+`src/models/qwen2.py`, `src/sampler.py`, `src/backend/metal.py`, flags in `scripts/serve.py`):
+1. **Packed prefill.** `forward_packed` runs the prompt chunks of several sequences as one forward: embedding,
+   norms, projections and MLP once over all their tokens; attention and the DeltaNet recurrence per sequence on
+   its slice, each against its own KV blocks and recurrent state. Result for each prompt vs prefilling it alone
+   (`tests/test_prefill.py`): max |Δlogit| 2.9e-6 (INT4 Metal), 0 (bf16 Metal), ≤ 2.7e-5 (fp32 CPU) for 4 short
+   prompts; ≤ 2.9e-5 for a 43-token pack, which takes the GEMM path while each prompt alone takes the batched
+   kernels (both keep fp32 activations).
+2. **Chunked prefill.** Requests go waiting → prefilling → running. Each loop iteration runs one packed pass over
+   at most `--prefill-chunk` prompt tokens (512), first come first served, then one decode step for every running
+   request, so a long prompt no longer freezes the batch. Admission reserves the prompt's KV blocks up front.
+3. **Batching window.** In the first load test of items 1–2, each 8-client wave's first request was prefilled
+   alone (~20 tokens) and the other 7, arriving a few ms later, together (~155 tokens): the idle engine started on
+   the first arrival (`raw/loadgen_2b_int4_2026-09-29_ab.md`, last section). An idle engine now waits while arrivals
+   keep coming within `--batch-wait-ms` (default 5 ms) of each other, twice that at most; a lone request waits
+   one window (6.2 ms measured, with the wake-up).
+4. **Batched sampling, which ended up on the CPU.** `sample_batch` applies the repetition penalty and selects
+   each row's top-(k + 8) candidates once for the whole batch; each request's temperature / top-k / top-p / seeded
+   draw then runs on its candidates only, exactly as the single-request sampler (300 random batches with ties and
+   penalties: identical tokens; `tests/test_sampling.py`). top_k 0 or > 256 and ties straddling the cut fall back
+   to the full-row sampler for that request alone. The plan was to run the selection on the GPU, where the logits
+   are. Measured, that saved nothing (8.8 → 8.4 ms per batch-8 step under HTTP load): `torch.topk` over 8 × 248k
+   logits takes 4.5 ms on MPS whatever k is, against 1.0 ms on the CPU, and with unified memory copying the
+   batch's logits to the CPU takes 0.5 ms. With the selection on the CPU, sampling takes 3.2 ms per step (was 6.9
+   in-process), and the batch-8 step 73.3 ms instead of 79.4 (`raw/profiling.md` §9).
+
+**Before/after** (raw: `raw/loadgen_2b_int4_2026-09-30_ab_final.md`). Same load test, the old code (bbeb6c6) and
+the final code measured side by side: 8 runs alternating in two opposite-order blocks (before-after-after-before,
+then after-before-before-after), each on a fresh server after a 90 s idle cool-down. Means over 4 runs each:
+
+| clients | throughput (tok/s) | TTFT p50 | TTFT p95 | TPOT p50 | e2e p50 |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 40.1 → 40.1 | 221 → 229 ms | 229 → 242 ms | 21.9 → 21.6 ms | 1.60 → 1.59 s |
+| 2 | 42.0 → **45.3** | 417 → **334** ms | 447 → **402** ms | 44.0 → **39.6** ms | 3.06 → **2.83** s |
+| 4 | 62.1 → **69.5** | 634 → **518** ms | 880 → **523** ms | 57.6 → **50.6** ms | 4.16 → **3.71** s |
+| 8 | 77.0 → **94.3** (+22%) | 1,056 → **838** ms | 1,710 → **892** ms | 91.5 → **72.6** ms | 6.67 → **5.44** s |
+
+Ranges at 8 clients: before 76.8–77.6 tok/s, after 92.5–95.0; at 2, 4 and 8 clients the slowest after-run beat
+the fastest before-run. At 1 client TTFT is 8 ms worse: in-process, the batching window costs a lone request
+6.2 ms (its 5 ms wait plus wake-up; `raw/profiling.md` §9) while the packed forward was 3.6 ms faster than the old
+one; the rest was not isolated. `--batch-wait-ms 0` turns the window off.
+
+**What is left of the gap to the engine's 116 tok/s.** Every request makes exactly 64 tokens, so 8 clients move in
+lockstep waves: one packed prefill pass for the wave's 8 prompts (0.82 s, which also yields their first tokens),
+then 63 decode steps of ~73 ms (the 70 ms `decode_batch` step, 3 ms sampling): ~5.4 s per 512 tokens, 94 tok/s,
+as measured (e2e p50 5.44 s). The prefill pass is ~15% of the time and sampling ~4%. Next: run the packed
+sequences' attention and DeltaNet prefill as one variable-length dispatch instead of one per sequence (~0.28 s of
+the pass; it would approach a single 184-token prompt's 0.54 s), and issue the decode step without Python in the
+loop.
+
+**An intermediate version** (the batched selection on MPS; raw: `raw/loadgen_2b_int4_2026-09-29_ab.md`) measured
+72.4 → 88.1 tok/s at 8 clients (TPOT 97.7 → 78.3 ms) in an earlier 10-run A/B. That evening 3 runs, 2 before and
+1 after, were excluded by a rule applied to both (8-client TPOT p50 above 120 ms; the others 76–106 ms): in each,
+the 1-client level was normal and the slowdown began partway through the run (at 4 clients in one, during the
+2-client level in the other two). In the one with CPU samples, macOS background services (ModelCatalogRuntime,
+AssistantServices, asset downloads, Shortcuts) took the top CPU slots at that moment and the server's step time
+tripled, while the python process shown in the samples fell from 28–42% to 4–14% CPU. That suggests the server was
+waiting (on a shared GPU, or on memory: swap was 5.5 of 6 GiB in use right after the first block) rather than
+computing; the samples cannot prove it. The final A/B applied the same rule and excluded none.
+
+**The same code measured 77 tok/s at 8 clients here, not the 55.9 published above** (67–78 over the 7
+before-runs kept in both A/Bs). At 1–2 clients the 2026-09-28 run and these agree within ~1% in throughput and
+TTFT p50 (TPOT p50 at 2 clients: 45.4 vs 44.0 ms); at 4–8 clients it was slower (TPOT p50 126 vs 91–106 ms).
+Its cause was not established, but it has the shape of the excluded runs (normal early in the run, slow later);
+the comparison above uses only runs taken side by side.
+
 ## Operational behaviour verified (tests/test_server.py, 45 checks; output in `raw/tests/test_server.txt`)
 
 Scope: the HTTP and scheduler checks run on Qwen2.5-0.5B on the CPU (fp32, fast and exact to compare against);
@@ -80,6 +173,6 @@ pooled state with forced preemption (INT4). The served 2B model itself was exerc
 | preemption changes nothing | KV pool too small for the load → preempted, recomputed, identical output; every block and state slot returned |
 | backpressure | queue of 1, 6 simultaneous requests → 429 + Retry-After, counted in `/metrics` |
 | streaming | SSE chunks concatenate to the non-stream text; UTF-8 held back until complete (Hindi); first chat delta carries the role |
-| client disconnect | real uvicorn: a non-streaming client that gives up after 1.5 s is cancelled server-side (43 of 400 tokens generated in the archived run, 29 in an earlier one recorded in `raw/early_measurements.md`; the server polls every second) |
+| client disconnect | real uvicorn: a non-streaming client that gives up after 1.5 s is cancelled server-side (45 of 400 tokens generated in the archived run of 2026-09-30, 43 and 29 in earlier ones recorded in `raw/early_measurements.md`; the server polls every second) |
 | graceful shutdown | scheduler drain: in-flight request finishes, new ones refused, `ready()` false (the flag `/ready` turns into a 503); real uvicorn: the lifespan stops the engine thread; manual `docker stop` mid-stream: the stream completed before exit (`raw/early_measurements.md`) |
 | bad input | 422 for invalid parameters (incl. lone surrogates, which crashed FastAPI's default handler), 400 for prompts that can never fit |

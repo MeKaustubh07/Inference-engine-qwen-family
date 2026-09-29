@@ -23,11 +23,12 @@ against Hugging Face `transformers`.
                         │  validate · chat template · tokenize · 429 when the queue is full
                         ▼
                       Scheduler (one engine thread owns the GPU)         src/server/scheduler.py
-                        │  waiting queue → admit (KV budget) → prefill → batched decode steps
+                        │  waiting → admit (KV budget) → packed chunked prefill → batched decode + sampling
                         │  tokens flow back via AsyncSink (call_soon_threadsafe), no thread per request
                         ▼
                       Model: Qwen35Model / Qwen2Model                    src/models/
                         │  forward(ids, state)      prefill, chunked DeltaNet (WY form, chunk 64)
+                        │  forward_packed(chunks)   several sequences' prompt chunks in one pass
                         │  decode_batch(tokens, states)   B sequences, one pass over the weights
                         ▼
                       Backend protocol (linear, rms_norm, rope, attention, deltanet_decode, …)  src/backend/
@@ -59,25 +60,38 @@ against Hugging Face `transformers`.
    (`prompt + max_tokens > max_model_len`, or more KV blocks than the pool holds) get 400.
 2. **Submit.** The request joins a bounded waiting queue. If the queue is full the client gets **429 with
    Retry-After**: shedding load early is better than accepting work that will time out.
-3. **Admit** (engine thread). A request is admitted when there is a batch slot and the pool has
-   `blocks(prompt) + one block of headroom per running sequence`. The headroom stops a newcomer from being
-   preempted on its very first step.
-4. **Prefill.** One `forward` over the prompt fills the KV blocks and the DeltaNet recurrent state, then samples
-   the first token (TTFT).
-5. **Decode.** Each loop iteration runs **one `decode_batch` for every running sequence**. Projections and MLPs
+3. **Admit** (engine thread). Requests move waiting → prefilling → running. A request is admitted when there is a
+   batch slot, a DeltaNet state slot, and room in the pool for `blocks(prompt) + one block of headroom per
+   sequence in flight`; its prompt's blocks are reserved on admission, so a prefill never runs out halfway. The
+   headroom stops a newcomer from being preempted on its very first step. When an idle engine is woken by an
+   arrival, it keeps collecting arrivals that come within 5 ms of each other (`--batch-wait-ms`, default 5; twice
+   that in total at most), so requests that arrive together share one prefill pass.
+4. **Prefill (packed and chunked).** Each loop iteration runs **one packed forward** over at most `prefill_chunk`
+   prompt tokens (default 512), taken first come, first served from the prefilling requests. Per-token work
+   (norms, projections, MLP) runs once over all their tokens, so several short prompts share one pass over the
+   weights; attention and the DeltaNet recurrence run per sequence on its slice. A long prompt is split into
+   chunks across iterations, with a decode step between chunks, so running requests keep generating. A request
+   whose whole prompt is in its state samples its first token (TTFT).
+5. **Decode.** Each loop iteration then runs **one `decode_batch` for every running sequence**. Projections and MLPs
    go through batched matvec kernels that read each weight once per step for the whole batch. Attention is one
    **paged-attention** dispatch per layer: every (head, sequence) reads its keys/values in place through its block
    table. The DeltaNet update is two dispatches per layer for the whole batch (conv step, delta-rule update),
    because every sequence's recurrent state lives in one pooled tensor (`HybridPool`) indexed by sequence slot.
-6. **Stream.** Tokens are decoded incrementally. Text ending in an incomplete UTF-8 character (U+FFFD) is held
+6. **Sample.** The batch's logits are copied to the CPU once (0.5 ms on unified memory), where the repetition
+   penalty and a top-(k + 8) candidate selection run once for every request; each request's temperature / top-k /
+   top-p / seeded draw then runs on its few dozen candidates, exactly as the single-request sampler would. (On
+   the M2, `torch.topk` over the 248k vocabulary is 4× faster on the CPU than on MPS, so the GPU was the wrong
+   place for it.) A request that cannot be sampled fails alone.
+7. **Stream.** Tokens are decoded incrementally. Text ending in an incomplete UTF-8 character (U+FFFD) is held
    back until the next token completes it. Each piece goes to the handler's asyncio queue and out as an SSE chunk.
-7. **Finish** on EOS, `max_tokens`, cancellation (client disconnect), or error. KV blocks go back to the pool
+8. **Finish** on EOS, `max_tokens`, cancellation (client disconnect), or error. KV blocks go back to the pool
    immediately, so a waiting request can take the slot on the next step.
 
 **Preemption.** If running sequences need more blocks than are free, the newest one is preempted: its blocks are
 freed and it goes back to the front of the queue with its generated tokens. When re-admitted it **recomputes**
-prompt + generated tokens in one prefill (vLLM-style recompute). The client sees a pause, not a gap: the output is
-identical to an uninterrupted run (`tests/test_server.py` checks this with greedy decoding).
+prompt + generated tokens through the same packed, chunked prefill (vLLM-style recompute). The client sees a
+pause, not a gap: the output is identical to an uninterrupted run (`tests/test_server.py` checks this with greedy
+decoding; `tests/test_prefill.py` with 4-token prefill chunks on Qwen3.5-0.8B INT4, the hybrid model).
 
 ## 4. Memory budget (Qwen3.5-2B, INT4, 8 GB machine)
 
@@ -105,7 +119,7 @@ of the ceiling.
 | single-stream decode (`decode_batch` step, no sampling) | 50 tok/s (llama.cpp Q4_1 42–53, MLX-LM 4-bit 70) |
 | batch-8 aggregate decode | 116 tok/s (llama.cpp 62, MLX-LM 73) |
 | prefill 256 / 1024 tokens | 398 / 450 tok/s (llama.cpp 601 / 452, MLX-LM 499 / 448) |
-| server, 8 closed-loop clients | 56 tok/s, TTFT p50 1.4 s, TPOT p50 126 ms (`docs/bench/serving.md`) |
+| server, 8 closed-loop clients | 94 tok/s, TTFT p50 0.84 s, TPOT p50 73 ms; the previous server measured side by side: 77 tok/s, 1.06 s, 92 ms (`docs/bench/serving.md`) |
 
 The levers that follow from this model:
 - **Fewer bytes per weight** (quantization). INT4 reads about a third of bf16's bytes. It is dequantized in
@@ -129,7 +143,8 @@ Prefill is compute-bound (`[T, K] × [K, N]` GEMMs), so it uses PyTorch's tuned 
 GEMM is 4× slower and is kept only for study. Quantized weights are expanded to fp32 by one kernel pass per 32 MB
 row chunk, then multiplied in fp32: on the M2, MPS runs fp32 GEMM at ~2.5 TFLOPS and bf16 at only ~1.4 (no
 native bf16 arithmetic before M3), so fp32 is both the faster and the exact choice. The first version expanded
-through several full-size fp32 tensor ops and took 2.0 s for a 256-token prompt; now 0.65 s.
+through several full-size fp32 tensor ops and took 2.0 s for a 256-token prompt; now 0.65 s. bf16 weights take
+the same route above 32 rows, so a prompt packed with others keeps fp32 activations, as it would alone.
 
 ## 6. Key decisions and trade-offs
 
@@ -162,7 +177,7 @@ through several full-size fp32 tensor ops and took 2.0 s for a 256-token prompt;
 - **Invariants**: cached == uncached; paged == contiguous; batched == sequential (greedy tokens identical, logits
   within 6e-5 in fp32 on the CPU; bit-identical in bf16 on Metal); preempted == uninterrupted; fused kernels ==
   reference ops; batched kernels == per-row kernels.
-- `scripts/run_tests.py` runs all 13 suites and exits nonzero on any failure.
+- `scripts/run_tests.py` runs all 14 suites and exits nonzero on any failure.
 
 ## 8. Operations
 
@@ -172,9 +187,9 @@ through several full-size fp32 tensor ops and took 2.0 s for a 256-token prompt;
 | overload | bounded queue → 429 + Retry-After; admission by KV blocks; preemption instead of OOM |
 | slow or gone clients | a disconnect (streaming, or non-streaming, polled every second) cancels the request at the next step and frees its blocks |
 | shutdown | SIGTERM → uvicorn stops accepting and lets open requests finish (up to `--drain-timeout`, 25 s) → the lifespan stops the scheduler (anything left has no client, 2 s) → exit; run containers with a longer stop timeout (`docker run --stop-timeout 30`) |
-| metrics | Prometheus: request/token counters, running/waiting/KV-free gauges, TTFT/TPOT/e2e histograms |
+| metrics | Prometheus: request/token counters, prefill passes and tokens, running/prefilling/waiting/KV-free gauges, TTFT/TPOT/e2e histograms |
 | logs | one JSON line per finished request (id, tokens, finish reason, TTFT, latency) |
-| failure isolation | an exception in one request's prefill or sampling fails that request only; a failed decode step fails the batch, not the server |
+| failure isolation | a failed packed prefill pass fails the requests in that pass; a request that cannot be sampled fails alone; a failed decode step fails every request in flight (running and still prefilling), not the server |
 
 ## 9. Deployment
 
@@ -226,10 +241,15 @@ The engine is **stateful**: a sequence's KV blocks and DeltaNet state live in on
 
 ## 11. Limitations and next steps
 
-- **The server trails the engine** (56 vs 116 tok/s at batch 8; `docs/bench/serving.md`): new prompts are prefilled
-  inside the engine loop while running sequences wait (chunked prefill is the fix; prefill/decode disaggregation
-  the multi-machine version), sampling runs per request on the CPU (~1.5 ms each over a 248k vocabulary; batched
-  GPU sampling would remove it), and ~28 ms per batch-8 step of other engine-loop work is not yet profiled.
+- **The server still trails the engine step** (94 vs 116 tok/s at 8 clients; `docs/bench/serving.md`). It was
+  77 (re-measured; the published 56 and its "~28 ms per step of unprofiled work" came from a run that was slower in
+  every step, for reasons not established). Profiling split the 77-vs-116 gap into ~57% prompts prefilled one at a
+  time while every running request waited and ~43% per-step work around the decode step, 8.8 ms of it per-request
+  CPU sampling. Packed + chunked prefill, a 5 ms batching window and batched sampling closed almost half of the gap
+  (77 → 94 of the engine's 116 tok/s). What remains is mostly the packed prefill pass (0.82 s for 8 short prompts,
+  ~15% of the time at 8 clients; sampling is ~4%). About a third of that pass (~0.28 s) is attention and the
+  DeltaNet recurrence running once per packed sequence: a variable-length prefill kernel is the next step
+  (prefill/decode disaggregation is the multi-machine version).
 - Batch 2 barely beats batch 1: the linears cost 33 vs 17 ms, and the 2-rows kernel is 1.2–2.1× slower than the
   single-row kernel at one row (which is why M = 1 keeps its own kernel).
   Simdgroup-matrix (8×8 hardware tile) kernels, as in MLX and llama.cpp's `mul_mm`, are the next step for both

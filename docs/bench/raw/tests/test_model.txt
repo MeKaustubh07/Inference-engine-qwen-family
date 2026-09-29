@@ -8,4 +8,4 @@ greedy 1: 'Hello world' -> "! I'm trying to create a program that can"  PASS
 greedy 2: 'def fibonacci(n):' -> ' \n    if n <= 1: \n       '  PASS
 greedy 3: 'The quick brown fox jumps over the lazy dog.' -> ' How many times does the word "fox" appear'  PASS
 greedy 4: 'Kaustubh builds an inference engine in Python.' -> ' He has a dataset of 1000'  PASS
-greedy decoding for 5 prompts x 10 tokens took 3.9s
+greedy decoding for 5 prompts x 10 tokens took 2.3s

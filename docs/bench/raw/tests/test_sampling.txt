@@ -18,5 +18,9 @@ PASS  padding ids (>= 151665) are never produced
 PASS  real reply stops on EOS before the token limit
 PASS  real reply stream == decode(generated ids)
 PASS  real reply mentions Paris
+PASS  sample_batch == sample row by row on cpu (300 random batches: greedy, penalties on the top tokens, top-k off or above the batch cap, all-tie and straddling ties): 0 mismatches
+PASS  sample_batch == sample row by row on mps (300 random batches: greedy, penalties on the top tokens, top-k off or above the batch cap, all-tie and straddling ties): 0 mismatches
+PASS  a NaN row yields its error while its seeded batch-mate keeps its own first draw (911 == 911)
+PASS  a batch-mate with top_k=149000 costs only its own row: 3 ms -> 25 ms (< base + 150 ms)
 
-19/19 checks passed
+23/23 checks passed

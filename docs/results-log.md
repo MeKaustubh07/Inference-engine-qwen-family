@@ -95,6 +95,26 @@ Details: `docs/bench/decode.md`, `docs/bench/quant.md`.
 | **final load test** (same setup as the first) | `f9280fa` (the prefill kernels it adds do not touch these 19–24-token prompts) | 40.3 / 41.5 / 52.9 / 55.9 tok/s at 1/2/4/8 clients; TTFT p50 221 ms → 1.4 s; 0 rejected |
 | why the server trails the engine (56 vs 116 at 8) | | lockstep waves (every request 64 tokens) start with 8 back-to-back prefills (~0.29 s each); then 108–110 ms per token vs a 69 ms step + ~12 ms CPU sampling, i.e. ~28 ms per step of unprofiled engine-loop work (`serving.md`) |
 
+## Closing the server gap (2026-09-29/30; `docs/bench/serving.md`, raw in `raw/profiling.md` §7–9)
+
+| step | result |
+|---|---|
+| re-measure the old server (bbeb6c6, same scheduler as `f9280fa`) | 39.3 / 41.3 / 61.2 / 77.0 and 36.5 / 40.5 / 61.6 / 73.6 tok/s at 1/2/4/8 clients (`raw/loadgen_2b_int4_2026-09-29_before_run*.md`), not 55.9 at 8; the 7 before-runs kept in the two A/Bs below: 67.3–77.6 at 8 clients, 39.8–40.3 at 1 (published: 40.3) |
+| profile of a server decode step, batch 8 (timers around the scheduler's methods + GPU synchronize) | HTTP 84.1 ms = 69.2 GPU + 4.1 issue + 8.8 sampling + 0.2 emit + 1.7 rest; in-process 79.4. **The ~28 ms did not reproduce**: the last-admitted request of an 8-client wave decoded at 77–90 ms/token in 9 re-measured runs vs 108–110 on 2026-09-28, a run slower in every step (cause not established). Gap to 116 tok/s (104 vs 69 ms per 8 tokens): ~20 ms one-at-a-time prefill (~0.35 s each under load, 5.6 s per run), ~15 ms per-step work (8.8 sampling, ~4 slower issue/GPU under load, ~2 emit/rest) |
+| prefill time vs prompt length, one forward | T = 1 / 23 / 184 / 256: 26 / 222 / 542 / 676 ms: prefill grows slowly with length (23 tokens cost 41% of 184); up to 32 rows the batched kernels re-read every weight once per 8 rows, above 32 the fp32 expansion + GEMM starts high and grows slowly (linears 184 ms at 33 rows, 194 at 64, 336 at 184) |
+| packed prefill (`forward_packed`) vs each prompt alone | max \|Δlogit\| 2.9e-6 INT4 Metal, 0 bf16 Metal, ≤ 2.7e-5 fp32 CPU; 43-token packs (GEMM path) ≤ 2.9e-5 |
+| bf16 weights above 32 rows: fp32 GEMM instead of bf16 activations (so packing does not change a prompt's numerics) | Qwen2.5-0.5B bf16 perplexity 11.336 → 11.350 (`raw/tests/test_quant.txt`); Qwen3.5-2B bf16 vs HF unchanged except one near-tie gap 0.015 → 0.019 |
+| first load test of packed + chunked prefill | no clear win: 72.3 tok/s at 8 (that session's baseline 77.0); in the server log each 8-client wave's first request was prefilled alone (~20 tokens) and the other 7, arriving a few ms later, together (~155 tokens); that request then ran a step ahead, so the next wave split the same way → **batching window** (default 5 ms, twice that at most) |
+| batched sampling with the selection on MPS | saved nothing: 8.8 → 8.4 ms per batch-8 step (HTTP) |
+| why: `torch.topk` over 8 × 248,320 | **MPS 4.5 ms for any k (1–64), CPU 1.0 ms**; copying the batch's logits to the CPU 0.48 ms (0.99 for the strided vocab slice) |
+| batched sampling on CPU logits | 2.2 ms vs 6.7 ms for the old per-row sampler (microbenchmark); in-process server profile: sampling 6.9 → 3.2 ms per step, batch-8 step 79.4 → 73.3 ms (no HTTP profile of the final code) |
+| packed prefill pass, 8 chat prompts (175 tokens) | 0.82 s warm, 1.33 s the first time (one at a time: ~1.8 s; one 184-token prompt: 0.54 s → per-sequence attention/DeltaNet costs ~40 ms per extra packed sequence) |
+| A/B 1 (intermediate: selection on MPS), 10 runs, 3 excluded by one rule (8-client TPOT p50 > 120 ms; in each the slowdown began mid-run; in the one run with CPU samples, macOS background services took the top CPU slots while the server's own CPU use fell) | 72.4 → 88.1 tok/s at 8 clients (`raw/loadgen_2b_int4_2026-09-29_ab.md`) |
+| reviews (3 rounds, 2-vote verification) | round 1 (14 agents): 2 confirmed: one request's large top_k slowed the whole batch's sampling → per-row fallback above 256; a bf16 pack over 32 tokens differed from the prompt alone → fp32 GEMM. Round 2 (16 agents): 5 confirmed (two of them the same issue): a failed batch retried rows with already-advanced seeded generators → per-row isolation; a cancelled request behind the chunk budget kept its blocks → all cancelled ones finish first; parity and tie tests too weak → strengthened, mutation-checked. Round 3 (8 agents): `--batch-wait-ms inf` killed the engine thread on the first request → bounded 0–1000; a cancel during the window counted as an arrival (split vote) → arrivals counted |
+| **A/B 2, final code, 8 runs (ABBA + BAAB), none excluded** | **77.0 → 94.3 tok/s at 8 clients** (ranges 76.8–77.6 vs 92.5–95.0); TTFT p50 1,056 → 838 ms, p95 1,710 → 892; TPOT 91.5 → 72.6 ms; 4 clients 62.1 → 69.5, 2 clients 42.0 → 45.3; 1 client unchanged (TTFT +8 ms; the window costs a lone request ~6 ms in-process, the rest not isolated) (`raw/loadgen_2b_int4_2026-09-30_ab_final.md`) |
+| what is left of the gap to 116 | lockstep waves: 0.82 s packed prefill (which yields the first tokens) + 63 × ~73 ms steps ≈ 5.4 s per 512 tokens ≈ 94 tok/s; prefill ~15%, sampling ~4% |
+| tests | 14 suites pass; `test_sampling` 23 (batched == per-row on CPU and MPS over 300 random batches), `test_prefill` 18, `test_server` 45 |
+
 ## Container (Docker Engine 29.5.3 in Docker Desktop, 3.83 GiB VM, 8 vCPU, arm64; transcript in `raw/early_measurements.md`)
 
 | check | result |
@@ -128,3 +148,8 @@ Load-test and benchmark tables: `docs/bench/serving.md`, `docs/bench/qwen35.md`,
 | batching speed-up | 20 | 1 confirmed | pooled-state scheduler test |
 | documentation numbers, round 1 | 140 | 67 → 38 confirmed, all fixed | GPU is 8-core, DeltaNet batch update is 2 dispatches, 2B answer key is bf16 |
 | documentation numbers, round 2 | ~90 | 45, fixed | server gap is lockstep prefill + CPU sampling + ~28 ms unprofiled work; variance up to ~20% |
+| server gap, round 1 | 14 | 5 → 2 confirmed | a large top_k slowed the whole batch; bf16 packs over 32 tokens differed from the prompt alone |
+| server gap, round 2 | 16 | 7 → 5 confirmed (2 duplicates) | seeded generators reused on retry; cancelled prefilling request kept its blocks; weak parity/tie tests |
+| server gap, round 3 (window, CPU sampling) | 8 | 3 → 1 confirmed, 1 split (both fixed) | `--batch-wait-ms inf` killed the engine thread; a cancel counted as an arrival |
+| server gap documentation numbers | 68 | 32 → 27 confirmed, 3 split, all fixed | 63 not 64 decode steps per wave; prefill cost explanation; "closed most of the gap" → almost half |
+| server gap documentation numbers, round 2 | 26 | 30 earlier fixes all hold; 11 new → 8 confirmed, 1 split, all fixed | the "~28 ms" was the 2026-09-28 run's slower steps, not prefill stalls; a breakdown that did not add up |

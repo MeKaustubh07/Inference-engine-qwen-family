@@ -103,8 +103,19 @@ class MetalBackend(TorchBackend):
         if isinstance(w, QuantTensor):
             return self._qlinear(x, w, b, residual)
         M = x.shape[0]
-        if M > KERNEL_ROWS or w.dtype != torch.bfloat16 or (M > 1 and w.shape[1] % 4):
-            return super().linear(x, w, b, residual)       # prefill (or K the batched kernel can't vectorize): GEMM
+        if w.dtype != torch.bfloat16:
+            return super().linear(x, w, b, residual)
+        if M > KERNEL_ROWS or (M > 1 and w.shape[1] % 4):
+            # prefill: fp32 GEMM on weights widened in 32 MB row chunks. Activations stay fp32 at every size, so a
+            # prompt's result does not depend on how many other prompts share its packed prefill (MPS's bf16 GEMM
+            # would round them), and fp32 GEMM is the faster one on the M2 (2.5 vs 1.4 TFLOPS)
+            x, step = x.float(), max(1, DEQUANT_CHUNK // w.shape[1])
+            y = torch.empty(M, w.shape[0], device=self.device)
+            for r in range(0, w.shape[0], step):
+                y[:, r:r + step] = x @ w[r:r + step].float().T
+            if b is not None:
+                y = y + b.float()
+            return y + residual if residual is not None else y
         if M > MAX_BATCH:
             return self._groups(self.linear, x, w, b, residual)
         N, K = w.shape

@@ -20,11 +20,15 @@ against the engine's own one-request-at-a-time decoding (batched, preempted and 
 | single-stream decode (engine step) | 50 tok/s | 42–53 tok/s | 70 tok/s |
 | batch-8 aggregate decode (engine step) | **116 tok/s** | 62 tok/s | 73 tok/s |
 | prefill, 256 / 1024 tokens | 398 / 450 tok/s | 601 / 452 tok/s | 499 / 448 tok/s |
-| through the HTTP server, 8 clients | 56 tok/s (TTFT p50 1.4 s) | — | — |
+| through the HTTP server, 8 clients | 94 tok/s (TTFT p50 0.84 s) | — | — |
 
 bf16 on our engine: KL 0.0004 with 0/190 flips; INT8: KL 0.0007 with greedy output identical to HF on all 70 test
-tokens. The server trails the engine step: new prompts are prefilled inside the decode loop, sampling runs on the
-CPU (~12 ms per batch-8 step), and ~28 ms per step of other server work is not yet profiled. Details and methodology: [`docs/bench/compare.md`](docs/bench/compare.md),
+tokens. The server went from 77 to 94 tok/s at 8 clients (measured side by side) after profiling showed where the
+gap to the engine step was: mostly prompts prefilled one at a time while every running request waited, plus ~9 ms
+per step of per-request sampling. Prompts are
+now packed into shared, chunked prefill passes, and sampling is batched (on the CPU, where top-k over the 248k
+vocabulary is 4× faster than on MPS). What remains is mostly the prefill pass itself (~15% of the time in this
+load test). Details and methodology: [`docs/bench/compare.md`](docs/bench/compare.md),
 [`docs/bench/qwen35.md`](docs/bench/qwen35.md), [`docs/bench/serving.md`](docs/bench/serving.md).
 
 ## What is in it
@@ -36,7 +40,7 @@ CPU (~12 ms per batch-8 step), and ~28 ms per step of other server work is not y
 | state | paged KV cache (block allocator, block tables) + fixed-size DeltaNet recurrent/conv state per sequence |
 | kernels (MSL) | bf16/INT8/INT4 matvec (+ batched), paged attention, batched DeltaNet step, RMSNorm, RoPE, fused SwiGLU, INT4/INT8 → fp32 expansion |
 | quantization | block-32 INT8, asymmetric INT4 with a calibrated per-tensor mixed-precision policy; `.qt` mmap format |
-| serving | continuous batching, recompute preemption, 429 backpressure, SSE streaming, cancellation, graceful drain |
+| serving | continuous batching, packed + chunked prefill, batched sampling, recompute preemption, 429 backpressure, SSE streaming, cancellation, graceful drain |
 | operations | `/health`, `/ready`, Prometheus `/metrics` (TTFT/TPOT/e2e histograms), JSON request logs, Dockerfile |
 
 ## Quick start
@@ -98,10 +102,11 @@ Then:
 scripts/.venv/bin/python scripts/run_tests.py
 ```
 
-`--quick` skips the quantization, Qwen3.5 and serving suites. The 13 suites cover tokenizer, ops, blocks, full
-models, sampling, caches, kernels, native runtime, quantization, Qwen3.5-0.8B, Qwen3.5-2B (bf16/INT8/INT4) and the
-server (batched == sequential, preemption, streaming, 429, cancellation, drain). The last full run's output is in
-[`docs/bench/raw/tests/`](docs/bench/raw/tests/).
+`--quick` skips the quantization, Qwen3.5, serving and prefill suites. The 14 suites cover tokenizer, ops, blocks,
+full models, sampling (incl. batched == per-request), caches, kernels, native runtime, quantization, Qwen3.5-0.8B,
+Qwen3.5-2B (bf16/INT8/INT4), the server (batched == sequential, preemption, streaming, 429, cancellation, drain)
+and packed/chunked prefill (packed == alone, chunked == sequential, batching window). The last full run's output
+is in [`docs/bench/raw/tests/`](docs/bench/raw/tests/).
 
 ## Benchmarks
 
