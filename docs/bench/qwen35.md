@@ -2,9 +2,9 @@
 
 The final model: 24 layers (18 Gated DeltaNet + 6 gated attention), hidden 2048, vocabulary 248,320, tied
 embedding. MacBook Air M2 (8-core GPU), 8 GB. Speed: code at commit `f9280fa` (raw:
-`docs/bench/raw/ours_2b_*.md`). Accuracy: re-run on the server-gap code (raw: `docs/bench/raw/tests/test_qwen35_2b.txt`;
-the `f9280fa` run, with the same KL, flips and greedy counts and a bf16 near-tie gap of 0.015, is
-`docs/bench/raw/accuracy_2b_vs_hf_bf16.txt`).
+`docs/bench/raw/ours_2b_*.md`). Accuracy: re-run on the server-gap code (raw:
+`docs/bench/raw/tests/2026-09-30-with-qwen2.5/test_qwen35_2b.txt`; the `f9280fa` run, with the same KL, flips and
+greedy counts and a bf16 near-tie gap of 0.015, is `docs/bench/raw/accuracy_2b_vs_hf_bf16.txt`).
 
 ## Accuracy vs Hugging Face (tests/test_qwen35_2b.py)
 

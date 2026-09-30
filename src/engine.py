@@ -6,8 +6,7 @@ import torch
 
 from backend.metal import MetalBackend
 from backend.torch_ref import TorchBackend
-from config import ModelConfig, Qwen35Config
-from models.qwen2 import Qwen2Model
+from config import Qwen35Config
 from models.qwen3_5 import Qwen35Model
 from quant import QtFile
 from tokenizer import Tokenizer
@@ -16,9 +15,6 @@ from weight_loader import SafetensorsFile
 ROOT = Path(__file__).resolve().parent.parent
 
 MODELS = {
-    "qwen2.5-0.5b": dict(dir="models/qwen2.5-0.5b", family="qwen2", weights="model.safetensors",
-                         eos=[151645, 151643], chat="qwen2.5", policy="configs/quant/qwen2.5-0.5b.json",
-                         sampling=dict(temperature=0.7, top_p=0.8, top_k=20, repetition_penalty=1.1)),
     "qwen3.5-0.8b": dict(dir="models/qwen3.5-0.8b", family="qwen3_5", weights="model.safetensors-00001-of-00001.safetensors",
                          eos=[248046, 248044], chat="qwen3.5", policy="configs/quant/qwen3.5-0.8b.json",
                          sampling=dict(temperature=0.7, top_p=0.8, top_k=20, repetition_penalty=1.0)),
@@ -56,8 +52,7 @@ def load_engine(name: str, backend: str = "metal", weights_file: str | None = No
     d = ROOT / spec["dir"]
     be = make_backend(backend, str(ROOT / spec["policy"]))
     weights = QtFile(weights_file) if weights_file else SafetensorsFile(str(d / spec["weights"]))
-    if spec["family"] == "qwen2":
-        model = Qwen2Model(ModelConfig.from_json(str(d / "config.json")), weights, be)
-    else:
-        model = Qwen35Model(Qwen35Config.from_json(str(d / "config.json")), weights, be)
+    if spec["family"] != "qwen3_5":
+        raise ValueError(f"unknown model family {spec['family']!r}")
+    model = Qwen35Model(Qwen35Config.from_json(str(d / "config.json")), weights, be)
     return Engine(name, model, Tokenizer(str(d / "tokenizer.json")), set(spec["eos"]), spec["chat"], spec["sampling"])

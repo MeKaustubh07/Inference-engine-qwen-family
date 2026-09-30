@@ -86,25 +86,21 @@ def run_scheduler(eng, prompts, n, chunk, kv_blocks=256, max_batch=4, lock_weigh
     return [eng.tokenizer.decode(r.generated) for r in reqs], dict(s.metrics.counters), order, s
 
 
-# ---------------------------------------------------------------- CPU fp32 (exact) on both families
-for name in ["qwen3.5-0.8b", "qwen2.5-0.5b"]:
-    eng = load_engine(name, "cpu")
-    packed_vs_alone(eng, 2e-3)
-    V, eos = eng.tokenizer.vocab_size(), set(eng.eos_ids)
-    want = [eng.tokenizer.decode(sequential(eng.model, V, eng.tokenizer.encode(p), 12, eos)) for p in PROMPTS]
-    texts, c, _, _ = run_scheduler(eng, PROMPTS, 12, chunk=4)
-    prompt_tokens = sum(len(eng.tokenizer.encode(p)) for p in PROMPTS)
-    check(f"{name}: prefill in 4-token chunks ({c['prefill_steps_total']} packed passes for {prompt_tokens} prompt "
-          f"tokens) == sequential greedy", texts == want and c["prefill_tokens_total"] == prompt_tokens
-          and c["prefill_steps_total"] >= prompt_tokens // 4)
-    texts, c, _, _ = run_scheduler(eng, PROMPTS, 12, chunk=512)
-    check(f"{name}: all 4 prompts packed into one prefill pass ({c['prefill_steps_total']} pass) == sequential greedy",
-          texts == want and c["prefill_steps_total"] == 1)
-    if name == "qwen2.5-0.5b":
-        cpu_eng = eng
-    else:
-        del eng
-        gc.collect()
+# ---------------------------------------------------------------- CPU fp32 (exact)
+name = "qwen3.5-0.8b"
+eng = load_engine(name, "cpu")                               # the one fp32 model in RAM, reused below
+packed_vs_alone(eng, 2e-3)
+V, eos = eng.tokenizer.vocab_size(), set(eng.eos_ids)
+want = [eng.tokenizer.decode(sequential(eng.model, V, eng.tokenizer.encode(p), 12, eos)) for p in PROMPTS]
+texts, c, _, _ = run_scheduler(eng, PROMPTS, 12, chunk=4)
+prompt_tokens = sum(len(eng.tokenizer.encode(p)) for p in PROMPTS)
+check(f"{name}: prefill in 4-token chunks ({c['prefill_steps_total']} packed passes for {prompt_tokens} prompt "
+      f"tokens) == sequential greedy", texts == want and c["prefill_tokens_total"] == prompt_tokens
+      and c["prefill_steps_total"] >= prompt_tokens // 4)
+texts, c, _, _ = run_scheduler(eng, PROMPTS, 12, chunk=512)
+check(f"{name}: all 4 prompts packed into one prefill pass ({c['prefill_steps_total']} pass) == sequential greedy",
+      texts == want and c["prefill_steps_total"] == 1)
+cpu_eng = eng
 
 # a request that is already generating keeps generating while a long prompt is prefilled chunk by chunk
 eng = cpu_eng
@@ -145,8 +141,8 @@ while first.out.get(timeout=600)[0] == "token":
     pass
 s.shutdown(5)
 check(f"a request cancelled behind a {len(long_ids)}-token prompt's 4-token chunks ends within {late} prefill step(s) "
-      f"(the long prompt needed {-(-len(long_ids) // 4)}); all KV blocks back",
-      queued.finish_reason == "cancelled" and late <= 1 and s.pool.allocator.num_free == 256)
+      f"(the long prompt needed {-(-len(long_ids) // 4)}); all KV blocks and state slots back",
+      queued.finish_reason == "cancelled" and late <= 1 and s.pool.allocator.num_free == 256 and len(s.pool.free_seqs) == 4)
 
 # requests arriving ~1 ms apart at an idle engine share one prefill pass (the batching window), and they are
 # not held back when arrivals stop
@@ -190,7 +186,7 @@ del eng, cpu_eng
 gc.collect()
 
 # ---------------------------------------------------------------- Metal: packed == alone; hybrid pool + chunks + preemption
-for name, backend, tol in [("qwen3.5-0.8b", "metal-int4", 1e-2), ("qwen2.5-0.5b", "metal", 1e-2)]:
+for name, backend, tol in [("qwen3.5-0.8b", "metal", 1e-2), ("qwen3.5-0.8b", "metal-int4", 1e-2)]:
     eng = load_engine(name, backend)
     packed_vs_alone(eng, tol)
     if backend == "metal-int4":

@@ -1,2 +1,2 @@
-Qwen2.5-0.5B: 66/66 cases match the official tokenizer (vocab 151665)
 Qwen3.5-0.8B: 66/66 cases match the official tokenizer (vocab 248077)
+PASS  Qwen3.5-2B tokenizer.json and tokenizer_config.json are byte-equal to the 0.8B's

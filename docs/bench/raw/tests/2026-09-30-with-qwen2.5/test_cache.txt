@@ -1,0 +1,25 @@
+PASS  prompt 0: cached vs uncached logits max|diff|=4.4e-05, same argmax everywhere
+PASS  prompt 1: cached vs uncached logits max|diff|=6.8e-04, same argmax everywhere
+PASS  prompt 2: cached vs uncached logits max|diff|=4.9e-05, same argmax everywhere
+PASS  prompt 3: cached vs uncached logits max|diff|=1.2e-04, same argmax everywhere
+PASS  prompt 4: cached vs uncached logits max|diff|=1.1e-04, same argmax everywhere
+PASS  chunked prefill on a non-empty cache (3 + 4 + 1...) matches uncached: max|diff|=1.2e-04
+PASS  prompt 0: cached greedy == HF greedy (all 10 tokens)
+PASS  prompt 1: cached greedy == HF greedy (all 10 tokens)
+PASS  prompt 2: cached greedy == HF greedy (all 10 tokens)
+PASS  prompt 3: cached greedy == HF greedy (all 10 tokens)
+PASS  prompt 4: cached greedy == HF greedy (all 10 tokens)
+      CPU fp32, 32 tokens: no cache 3.25s (9.9 tok/s)  |  cache 1.39s (23.1 tok/s)  -> 2.3x
+PASS  cached and uncached produce the same 32 tokens
+PASS  cache is faster
+PASS  KV cache bytes = 122880 for 5 tokens (24576 B/token in fp32, 12288 in bf16)
+PASS  MPS fp32 weights: cached (contiguous) == uncached at every position, max|diff|=1.1e-04
+PASS  MPS fp32 weights: cached (paged) == uncached at every position, max|diff|=1.1e-04
+PASS  MPS bf16 (contiguous): cached vs uncached 0.43 within bf16 budget 0.76; argmax equal at 7/10 non-tied positions
+PASS  MPS bf16 (paged): cached vs uncached 0.43 within bf16 budget 0.76; argmax equal at 7/10 non-tied positions
+PASS  MPS bf16: 10-token cached greedy matches HF fp32 for 10/10 tokens
+PASS  Metal kernels (contiguous): cached vs uncached 0.00 within bf16 budget 0.00; argmax equal at 7/10 non-tied positions
+PASS  Metal kernels (paged): cached vs uncached 0.00 within bf16 budget 0.00; argmax equal at 7/10 non-tied positions
+PASS  Metal kernels: 10-token cached greedy matches HF fp32 for 10/10 tokens
+
+22/22 checks passed

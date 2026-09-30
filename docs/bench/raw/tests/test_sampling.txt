@@ -8,19 +8,16 @@ PASS  top_p tiny still keeps one token
 PASS  repetition penalty, positive logit: repeated token loses its lead
 PASS  repetition penalty, negative logit: repeated token is pushed further down
 PASS  seeded sampling is reproducible and not constant
-PASS  chat template matches HF (1 messages)
-PASS  chat template matches HF (2 messages)
-PASS  chat template matches HF (3 messages)
 PASS  stream ending on an emoji is complete: ' Hi 🫠'
 PASS  length-cut stream equals decode of generated ids: ' é中文�'
-PASS  padding ids (>= 151665) are never produced
-      reply: 'The capital of France is Paris.'  (7 tokens, stop=eos)
+PASS  padding ids (>= 248077) are never produced
+PASS  sample_batch == sample row by row on cpu (300 random batches: greedy, penalties on the top tokens, top-k off or above the batch cap, all-tie and straddling ties): 0 mismatches
+PASS  sample_batch == sample row by row on mps (300 random batches: greedy, penalties on the top tokens, top-k off or above the batch cap, all-tie and straddling ties): 0 mismatches
+PASS  a NaN row yields its error while its seeded batch-mate keeps its own first draw (417 == 417)
+PASS  a batch-mate with top_k=247000 costs only its own row: 4 ms -> 41 ms (< base + 150 ms)
+      reply: ' Paris is the capital of France.'  (7 tokens, stop=eos)
 PASS  real reply stops on EOS before the token limit
 PASS  real reply stream == decode(generated ids)
 PASS  real reply mentions Paris
-PASS  sample_batch == sample row by row on cpu (300 random batches: greedy, penalties on the top tokens, top-k off or above the batch cap, all-tie and straddling ties): 0 mismatches
-PASS  sample_batch == sample row by row on mps (300 random batches: greedy, penalties on the top tokens, top-k off or above the batch cap, all-tie and straddling ties): 0 mismatches
-PASS  a NaN row yields its error while its seeded batch-mate keeps its own first draw (911 == 911)
-PASS  a batch-mate with top_k=149000 costs only its own row: 3 ms -> 25 ms (< base + 150 ms)
 
-23/23 checks passed
+20/20 checks passed

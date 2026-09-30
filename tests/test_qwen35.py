@@ -1,4 +1,5 @@
 """Week 13: the Qwen3.5-0.8B port vs the HF fp32 answer key: every layer, logits, greedy decode, cached decode."""
+import gc
 import glob
 import sys
 import time
@@ -22,6 +23,7 @@ results = []
 def check(name, ok):
     results.append(bool(ok)); print(f"{'PASS' if ok else 'FAIL'}  {name}")
 
+check("loader: the header's tensor catalog accounts for every byte of the file", weights.integrity_check())
 print(f"layer types: {''.join('A' if t == 'full_attention' else 'L' for t in cfg.layer_types)}  (A = gated attention, L = Gated DeltaNet)")
 N_GOLD = len(glob.glob("tests/golden_qwen35/*.pt"))              # 7: includes prompts longer than a 64-token chunk
 for n in range(N_GOLD):
@@ -119,11 +121,19 @@ if torch.backends.mps.is_available():
     check(f"fused Metal DeltaNet decode == reference over 4 steps (output rel / state / conv-tail worst {worst:.1e}); other slots untouched",
           worst < 1e-4 and torch.equal(sm.S[0], sr.S[0]) and torch.equal(sm.S[2], sr.S[2]))
 
+    del model; gc.collect()                                   # the fp32 CPU copy is done: keep one model in RAM
     gm = Qwen35Model(cfg, weights, MetalBackend())
-    match = 0
+    V = tok.vocab_size()
+    match, flips, n_clear = 0, [], 0
     for n in range(N_GOLD):
         g = torch.load(f"tests/golden_qwen35/{n}.pt"); out = generate_greedy(gm, tok, g["text"], 10, EOS)
         match += next((j for j, (x_, y_) in enumerate(zip(out, g["greedy"].tolist())) if x_ != y_), min(len(out), len(g["greedy"])))
+        lg, ref = gm.forward(g["ids"]).cpu()[:, :V], g["logits"][:, :V]
+        top2 = ref.topk(2, -1).values
+        clear = (top2[:, 0] - top2[:, 1]) > 0.5                  # bf16 may flip a near-tie; a clear winner must hold
+        flips.append(int((lg.argmax(-1) != ref.argmax(-1))[clear].sum())); n_clear += int(clear.sum())
+    check(f"Metal backend (bf16 weights): prefill top-1 == HF fp32 at every non-tied position ({n_clear} positions, "
+          f"flips per prompt: {flips})", sum(flips) == 0)
     check(f"Metal backend (bf16 weights): greedy matches HF fp32 for {match}/{10 * N_GOLD} tokens", match >= 9 * N_GOLD)
     del gm
 

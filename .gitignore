@@ -4,7 +4,6 @@ __pycache__/
 *.pyc
 *.log
 .DS_Store
-tests/golden/
 build/
 tests/golden_qwen35/
 tests/golden_qwen35_2b/

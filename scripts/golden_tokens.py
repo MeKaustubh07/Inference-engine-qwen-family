@@ -1,6 +1,6 @@
 """Answer key: tokenize test strings with the official HF tokenizer, write JSON goldens.
 
-usage: golden_tokens.py [model_dir] [out.json]      (default: Qwen2.5-0.5B -> tests/golden_tokens.json)
+usage: golden_tokens.py [model_dir] [out.json]      (default: Qwen3.5-0.8B -> tests/golden_tokens_qwen35.json)
 """
 import json
 import random
@@ -8,8 +8,8 @@ import sys
 
 from tokenizers import Tokenizer
 
-model_dir = sys.argv[1] if len(sys.argv) > 1 else "models/qwen2.5-0.5b"
-out_path = sys.argv[2] if len(sys.argv) > 2 else "tests/golden_tokens.json"
+model_dir = sys.argv[1] if len(sys.argv) > 1 else "models/qwen3.5-0.8b"
+out_path = sys.argv[2] if len(sys.argv) > 2 else "tests/golden_tokens_qwen35.json"
 tok = Tokenizer.from_file(f"{model_dir}/tokenizer.json")
 cases = [
     "The capital of France is",

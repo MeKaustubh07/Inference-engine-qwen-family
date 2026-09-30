@@ -1,4 +1,4 @@
-"""Week 15: serving. Batched decode == sequential decode for both model families (fp32 CPU, exact greedy), sequences
+"""Week 15: serving. Batched decode == sequential decode for the hybrid Qwen3.5 model (fp32 CPU, exact greedy), sequences
 joining/leaving mid-batch, batched quantized kernels == per-row kernels, Metal batched decode within bf16 noise,
 preemption-by-recompute, and the HTTP API: completions, chat, SSE streaming, 429 backpressure, validation,
 metrics, cancellation, seeded sampling and graceful drain."""
@@ -19,7 +19,7 @@ from sampler import SamplingParams
 from server.app import OutputFilter, create_app
 from server.metrics import Metrics
 from server.scheduler import Scheduler
-from server.scheduler import QueueFull
+from server.scheduler import QueueFull, Request
 
 results = []
 def check(name, ok):
@@ -29,7 +29,8 @@ GREEDY = SamplingParams(temperature=0, repetition_penalty=1.0)
 PROMPTS = ["The capital of France is", "def fibonacci(n):",
            "The history of computing is a story of abstraction. Each generation of engineers built tools that",
            "Hello world"]
-HINDI = "नमस्ते दुनिया, यह एक परीक्षण है।"      # multi-byte characters split across tokens: exercises the UTF-8 holdback
+HINDI = "नमस्ते दुनिया, यह एक परीक्षण है।"      # multi-byte text; Qwen3.5 has a token per character here, so the UTF-8
+                                                # holdback is checked separately by feeding the detokenizer a split emoji
 
 
 def sequential(model, V, ids, n, eos=()):
@@ -71,23 +72,19 @@ def batched(model, V, prompts, n, join_at):
 
 
 # ---------------------------------------------------------------- 1. batched == sequential (fp32 CPU, exact)
-for name in ["qwen3.5-0.8b", "qwen2.5-0.5b"]:       # one fp32 model in RAM at a time; keep the small one
-    eng = load_engine(name, "cpu")
-    V, N = eng.tokenizer.vocab_size(), 10
-    ids = [eng.tokenizer.encode(p) for p in PROMPTS[:3]]
-    ref = [sequential(eng.model, V, x, N) for x in ids]
-    got, logs, pool = batched(eng.model, V, ids, N, join_at=[0, 0, 3])    # third joins mid-flight
-    check(f"{name}: batched greedy == sequential for 3 prompts (one joins at step 3)",
-          all(got[j] == ref[j][0] for j in range(3)))
-    diff = max((a - b).abs().max().item() for j in range(3) for a, b in zip(logs[j], ref[j][1]))
-    check(f"{name}: batched logits == sequential logits (max|diff| {diff:.1e} < 2e-3)", diff < 2e-3)
-    check(f"{name}: every KV block returned to the pool after sequences leave",
-          pool.allocator.num_free == pool.allocator.num_blocks)
-    if name == "qwen2.5-0.5b":
-        cpu_eng = eng
-    else:
-        del eng
-    gc.collect()
+name = "qwen3.5-0.8b"
+eng = load_engine(name, "cpu")                      # the one fp32 model in RAM, reused by the HTTP suites below
+V, N = eng.tokenizer.vocab_size(), 10
+ids = [eng.tokenizer.encode(p) for p in PROMPTS[:3]]
+ref = [sequential(eng.model, V, x, N) for x in ids]
+got, logs, pool = batched(eng.model, V, ids, N, join_at=[0, 0, 3])    # third joins mid-flight
+check(f"{name}: batched greedy == sequential for 3 prompts (one joins at step 3)",
+      all(got[j] == ref[j][0] for j in range(3)))
+diff = max((a - b).abs().max().item() for j in range(3) for a, b in zip(logs[j], ref[j][1]))
+check(f"{name}: batched logits == sequential logits (max|diff| {diff:.1e} < 2e-3)", diff < 2e-3)
+check(f"{name}: every KV block and DeltaNet state slot returned to the pool after sequences leave",
+      pool.allocator.num_free == pool.allocator.num_blocks and len(pool.free_seqs) == 8)
+cpu_eng = eng
 
 # ---------------------------------------------------------------- 2a. output filter (reasoning split, stop strings)
 f = OutputFilter(True, [])
@@ -109,7 +106,7 @@ f = OutputFilter(False, ["END"])
 check("held-back tail that never becomes a stop string is flushed",
       "".join(t for _, t in f.feed("abcEN") + f.flush()) == "abcEN" and not f.stopped)
 
-# ---------------------------------------------------------------- 2. HTTP API over the scheduler (fp32 CPU qwen2.5)
+# ---------------------------------------------------------------- 2. HTTP API over the scheduler (fp32 CPU qwen3.5-0.8b)
 eng = cpu_eng
 V, tok = eng.tokenizer.vocab_size(), eng.tokenizer
 EOS = set(eng.eos_ids)
@@ -237,8 +234,9 @@ async def api_suite():
         if kind != "token":
             break
     time.sleep(0.2)
-    check("cancel stops generation early and frees its KV blocks",
-          payload == "cancelled" and len(req.generated) < 200 and sched.pool.allocator.num_free == 128)
+    check("cancel stops generation early and frees its KV blocks and state slot",
+          payload == "cancelled" and len(req.generated) < 200 and sched.pool.allocator.num_free == 128
+          and len(sched.pool.free_seqs) == 4)
 
     # graceful drain: in-flight request finishes, new ones are refused
     req = sched.submit(tok.encode(PROMPTS[1]), GREEDY, 10)
@@ -252,6 +250,17 @@ async def api_suite():
         refused = True
     check("graceful shutdown drains the in-flight request, then refuses new ones and reports not-ready",
           items[-1] == ("done", "length") and len(req.generated) == 10 and refused and not sched.ready())
+
+    # the server's incremental detokenizer holds back a character split across tokens (two emoji, 3 + 2 pieces each)
+    ids = tok.encode(" Hi 🫠 é中文🫠")
+    r = Request("utf8", [], GREEDY, 100)
+    for t in ids:
+        sched._emit(r, t)
+    pieces = []
+    while not r.out.empty():
+        pieces.append(r.out.get()[1])
+    check(f"UTF-8 holdback: {len(ids)} tokens -> {len(pieces)} pieces {pieces}, none with U+FFFD, joined == decode(ids)",
+          "".join(pieces) == tok.decode(ids) and not any("\ufffd" in p for p in pieces) and len(pieces) < len(ids))
 
 
 async def backpressure_suite():
@@ -280,7 +289,7 @@ async def backpressure_suite():
 
 
 async def preemption_suite():
-    # 3 sequences x (prompt + 30 tokens) need 3 blocks each (block 16) = 9 > 6: the pool runs dry mid-generation
+    # 3 sequences x (prompt + 30 tokens) need 3 + 3 + 2 blocks (block 16) = 8 > 6: the pool runs dry mid-generation
     app = create_app(eng, max_batch=4, max_waiting=8, kv_blocks=6, max_model_len=96)
     prompts = [PROMPTS[0], PROMPTS[1], PROMPTS[3]]
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t", timeout=300) as c:
@@ -291,7 +300,8 @@ async def preemption_suite():
     n_pre = int(float(pre[0].split()[-1])) if pre else 0
     check(f"KV pool exhaustion preempts ({n_pre} preemptions) and recomputes: outputs still == sequential greedy",
           n_pre >= 1 and [r.json()["choices"][0]["text"] for r in rs] == [ref_text(p, 30) for p in prompts])
-    check("all KV blocks free after preempted requests finish", app.state.scheduler.pool.allocator.num_free == 6)
+    check("all KV blocks and state slots free after preempted requests finish",
+          app.state.scheduler.pool.allocator.num_free == 6 and len(app.state.scheduler.pool.free_seqs) == 4)
     app.state.scheduler.shutdown(5)
 
 
@@ -332,7 +342,8 @@ def uvicorn_suite():
         time.sleep(0.1)
     made = sched.metrics.counters["generation_tokens_total"] - before
     check(f"real uvicorn: a non-streaming request whose client gave up is cancelled ({made} of 400 tokens made), "
-          f"blocks freed", not sched.active and made < 400 and sched.pool.allocator.num_free == 64)
+          f"blocks and state slot freed", not sched.active and made < 400 and sched.pool.allocator.num_free == 64
+          and len(sched.pool.free_seqs) == 2)
     last = json.loads([m for m in logged if '"request_finished"' in m][-1])
     check(f"its request_finished log line says finish_reason {last['finish_reason']!r} (the engine stops it one step "
           f"after the handler logs)", last["finish_reason"] == "cancelled" and last["completion_tokens"] < 400)
@@ -398,7 +409,7 @@ for scheme in ["bf16", "int8", "int4"]:
     check(f"batched {scheme} matvec (M=2,3,8,13,32; with/without bias and residual) == per-row kernel == dense "
           f"(worst {worst:.1e})", worst < 1e-3)
 
-for name, backend in [("qwen3.5-0.8b", "metal"), ("qwen3.5-0.8b", "metal-int4"), ("qwen2.5-0.5b", "metal")]:
+for name, backend in [("qwen3.5-0.8b", "metal"), ("qwen3.5-0.8b", "metal-int4")]:
     # batched decode (pooled DeltaNet state, paged attention, batched matvec kernels) must give each request the
     # same output as decoding it alone: bit-identical for bf16; INT4 dequantizes in a different order (rounding)
     eng = load_engine(name, backend)

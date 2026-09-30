@@ -1,4 +1,3 @@
-PASS  loader: the header's tensor catalog accounts for every byte of the file
 layer types: LLLALLLALLLALLLALLLALLLA  (A = gated attention, L = Gated DeltaNet)
 PASS  prompt 0: tokenizer ids == HF ids (5 tokens)
 PASS  prompt 0 (5 tokens): embed exact, worst layer rel diff 2.4e-06 (layer 3, full_attention), final norm rel 1.3e-06, logits max|diff| 3.3e-05, top-1 100%
@@ -21,7 +20,7 @@ PASS  prompt 3: cached greedy == HF: '\nThe quick brown fox jumps over the lazy 
 PASS  prompt 4: cached greedy == HF: '\nयह परीक्षण के लिए आपको एक'
 PASS  prompt 5: cached greedy == HF: '\n\nThe history of computing is also a story of'
 PASS  prompt 6: cached greedy == HF: ' Inference engines turn trained weights into answers. In'
-      greedy decoding, 7 prompts x 10 tokens: 8.6s
+      greedy decoding, 7 prompts x 10 tokens: 7.7s
 PASS  hybrid state (contiguous KV + recurrent/conv): 126 tokens as 70 + 65 + singles == uncached, max|diff| 4.3e-05
 PASS  hybrid state (paged KV + recurrent/conv): 126 tokens as 70 + 65 + singles == uncached, max|diff| 4.3e-05
 PASS  KV exhaustion raises before any layer runs: recurrent and conv state unchanged, length unchanged
@@ -40,7 +39,6 @@ PASS  qwen3.5 chat template matches HF (3 messages, thinking on)
 PASS  qwen3.5 chat template matches HF (3 messages, thinking off)
 PASS  qwen3.5 chat template matches HF (3 messages, thinking on)
 PASS  fused Metal DeltaNet decode == reference over 4 steps (output rel / state / conv-tail worst 4.9e-07); other slots untouched
-PASS  Metal backend (bf16 weights): prefill top-1 == HF fp32 at every non-tied position (183 positions, flips per prompt: [0, 0, 0, 0, 0, 0, 0])
 PASS  Metal backend (bf16 weights): greedy matches HF fp32 for 70/70 tokens
 
-42/42 checks passed
+40/40 checks passed

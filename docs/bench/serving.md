@@ -98,7 +98,7 @@ take 0.82 s (1.33 s the first time that size is seen; `raw/profiling.md` §9), m
 (0.54 s) because attention and the DeltaNet recurrence still run per sequence (~40 ms per extra sequence).
 
 What changed (`src/server/scheduler.py`, `src/models/packing.py`, `forward_packed` in `src/models/qwen3_5.py` and
-`src/models/qwen2.py`, `src/sampler.py`, `src/backend/metal.py`, flags in `scripts/serve.py`):
+`src/models/qwen2.py` (since removed), `src/sampler.py`, `src/backend/metal.py`, flags in `scripts/serve.py`):
 1. **Packed prefill.** `forward_packed` runs the prompt chunks of several sequences as one forward: embedding,
    norms, projections and MLP once over all their tokens; attention and the DeltaNet recurrence per sequence on
    its slice, each against its own KV blocks and recurrent state. Result for each prompt vs prefilling it alone
@@ -210,19 +210,20 @@ Also seen, not fixed: the first request of a given prompt length after start-up 
 0.34–0.45 s vs 0.25 s, with little memory brought back), most likely MPS compiling kernels for new tensor shapes;
 warming the common prompt lengths at start-up would remove it.
 
-## Operational behaviour verified (tests/test_server.py, 48 checks; output in `raw/tests/test_server.txt`)
+## Operational behaviour verified (tests/test_server.py, 45 checks; output in `raw/tests/test_server.txt`)
 
-Scope: the HTTP and scheduler checks run on Qwen2.5-0.5B on the CPU (fp32, fast and exact to compare against);
-Qwen3.5 on Metal is covered by batched == single-sequence decode (bf16, INT4) and by a scheduler run over its
-pooled state with forced preemption (INT4). The served 2B model itself was exercised by the load test.
+Scope: the HTTP and scheduler checks run on Qwen3.5-0.8B on the CPU (fp32, exact to compare against); until
+2026-09-30 they ran on Qwen2.5-0.5B (48 checks, `raw/tests/2026-09-30-with-qwen2.5/test_server.txt`). Qwen3.5 on
+Metal is covered by batched == single-sequence decode (bf16, INT4) and by a scheduler run over its pooled state with
+forced preemption (INT4). The served 2B model itself was exercised by the load test.
 
 | behaviour | how it is tested |
 |---|---|
 | continuous batching changes nothing | 4 concurrent requests == sequential greedy; mean decode batch > 1.5 asserted |
 | preemption changes nothing | KV pool too small for the load → preempted, recomputed, identical output; every block and state slot returned |
 | backpressure | queue of 1, 6 simultaneous requests → 429 + Retry-After, counted in `/metrics` |
-| streaming | SSE chunks concatenate to the non-stream text; UTF-8 held back until complete (Hindi); first chat delta carries the role |
-| client disconnect | real uvicorn: a non-streaming client that gives up after 1.5 s is cancelled server-side (44 of 400 tokens generated in the archived run, 45, 43 and 29 in earlier ones recorded in `raw/early_measurements.md`; the server polls every second) |
+| streaming | SSE chunks concatenate to the non-stream text; UTF-8 held back until complete (the scheduler's detokenizer fed an emoji split across tokens; Hindi stream == non-stream); first chat delta carries the role |
+| client disconnect | real uvicorn: a non-streaming client that gives up after 1.5 s is cancelled server-side (4 of 400 tokens generated in the archived Qwen3.5-0.8B run; the Qwen2.5-0.5B runs made 44 (`raw/tests/2026-09-30-with-qwen2.5/test_server.txt`), 45, 43 and 29 (`raw/early_measurements.md`); the server polls every second) |
 | graceful shutdown | scheduler drain: in-flight request finishes, new ones refused, `ready()` false (the flag `/ready` turns into a 503); real uvicorn: the lifespan stops the engine thread; manual `docker stop` mid-stream: the stream completed before exit (`raw/early_measurements.md`) |
 | bad input | 422 for invalid parameters (incl. lone surrogates, which crashed FastAPI's default handler), 400 for prompts that can never fit |
 | queue gauges | the engine held mid-step, a second request submitted: `/metrics` shows `waiting 1, running 1` (read at scrape time) |

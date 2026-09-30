@@ -20,9 +20,9 @@ def rope(x: torch.Tensor, positions: torch.Tensor, theta: float) -> torch.Tensor
 
     x:         [T, H, d]  queries or keys, split into H heads of d numbers
     positions: [T]        position of each token in the sequence (0, 1, 2, ...)
-    theta:     base frequency from the config (1e6 for Qwen2.5)
+    theta:     base frequency from the config (1e7 for Qwen3.5)
 
-    Pairing convention (Qwen2 / HF "rotate_half"): number i pairs with number i + d/2.
+    Pairing convention (HF "rotate_half"): number i pairs with number i + d/2.
     """
     d = x.shape[-1]
     half = d // 2
@@ -55,8 +55,8 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, causal: bool = 
     """
     T, Hq, d = q.shape
     S, Hkv, _ = k.shape
-    group = Hq // Hkv                                   # 14 // 2 = 7 query heads share each key/value head
-    k = k.float().repeat_interleave(group, dim=1)       # [S, Hq, d]: KV head 0 serves query heads 0-6, head 1 serves 7-13
+    group = Hq // Hkv                                   # 8 // 2 = 4 query heads share each key/value head
+    k = k.float().repeat_interleave(group, dim=1)       # [S, Hq, d]: KV head 0 serves query heads 0-3, head 1 serves 4-7
     v = v.float().repeat_interleave(group, dim=1)
 
     qh, kh, vh = q.float().transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1)   # heads first: [H, tokens, d]

@@ -1,7 +1,7 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// RoPE, Qwen2 "rotate_half" pairing: number i pairs with number i + d/2.
+// RoPE, HF "rotate_half" pairing: number i pairs with number i + d/2.
 // One thread per (token, head, pair). x/out: [T, H, d] contiguous, positions: [T].
 kernel void rope(device float* out           [[buffer(0)]],
                  device const float* x       [[buffer(1)]],

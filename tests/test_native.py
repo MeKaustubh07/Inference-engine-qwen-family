@@ -13,6 +13,7 @@ def check(name, ok):
 nm = NativeMetal()
 print(f"      device: {nm.device_name}")
 torch.manual_seed(0)
+# synthetic shapes (Qwen2.5-0.5B's), kept so the GB/s stay comparable with docs/bench/decode.md
 for N, K in ((896, 896), (4864, 896), (151936, 896)):
     W = (torch.randn(N, K) * 0.05).to(torch.bfloat16)
     x = torch.randn(K)

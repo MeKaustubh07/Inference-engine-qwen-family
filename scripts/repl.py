@@ -1,6 +1,6 @@
 """Terminal chat with the engine: multi-turn, streaming.
 
-usage: repl.py [--model qwen2.5-0.5b|qwen3.5-0.8b|qwen3.5-2b] [--backend cpu|mps|metal|metal-int8|metal-int4] [--weights file.qt]
+usage: repl.py [--model qwen3.5-0.8b|qwen3.5-2b] [--backend cpu|mps|metal|metal-int8|metal-int4] [--weights file.qt]
 """
 import argparse
 import sys
@@ -14,7 +14,7 @@ from sampler import SamplingParams
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="qwen2.5-0.5b")
+    ap.add_argument("--model", default="qwen3.5-0.8b")
     ap.add_argument("--backend", default="metal")
     ap.add_argument("--weights", default=None, help="optional pre-quantized .qt file")
     ap.add_argument("--think", action="store_true", help="Qwen3.5: let the model think before answering")

@@ -213,8 +213,8 @@ class Scheduler:
                 # its next step; otherwise the newcomer would be preempted right away and its prefill wasted
                 if self._blocks_for(len(ids) + 1) + in_flight > self.pool.allocator.num_free:
                     return                                    # wait for running requests to free blocks
-                if not getattr(self.pool, "free_seqs", True):
-                    return                                    # hybrid models: wait for a DeltaNet state slot too
+                if not self.pool.free_seqs:
+                    return                                    # wait for a DeltaNet state slot too
                 self.waiting.popleft()
             try:
                 req.state = self.model.new_paged_state(self.pool)

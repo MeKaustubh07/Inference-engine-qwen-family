@@ -1,6 +1,6 @@
 """Benchmark harness: TTFT, TPOT, prefill/decode throughput, peak memory, and the bandwidth ceiling.
 
-usage: bench.py [--model qwen2.5-0.5b] [--backend cpu|mps|metal|metal-int8|metal-int4] [--weights FILE.qt]
+usage: bench.py [--model qwen3.5-0.8b] [--backend cpu|mps|metal|metal-int8|metal-int4] [--weights FILE.qt]
                 [--prompt-lens 16,256,1024] [--new 32] [--no-cache] [--batch 1,2,4,8] [--out docs/bench/x.md]
 
 --batch measures continuous-batching decode: B sequences advance together through model.decode_batch, and the
@@ -84,7 +84,7 @@ def bench_batch(model, tok, B: int, steps: int, sync) -> float:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="qwen2.5-0.5b")
+    ap.add_argument("--model", default="qwen3.5-0.8b")
     ap.add_argument("--backend", choices=["cpu", "mps", "metal", "metal-int8", "metal-int4"], default="cpu")
     ap.add_argument("--weights", default=None, help="pre-quantized .qt file")
     ap.add_argument("--prompt-lens", default="16,256,1024")

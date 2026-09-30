@@ -4,7 +4,7 @@ For each 2-D weight, quantize ONLY that tensor to INT4 (everything else bf16) an
 next-token distribution against reference logits (HF goldens), separately at position 0 (the attention-sink first
 token) and at later positions. Tensors whose damage exceeds the threshold stay INT8 in INT4 mode.
 
-usage: calibrate_quant.py --model qwen2.5-0.5b|qwen3.5-0.8b|qwen3.5-2b --golden-dir DIR [--threshold 0.005] [--out F]
+usage: calibrate_quant.py --model qwen3.5-0.8b|qwen3.5-2b [--golden-dir DIR] [--threshold 0.005] [--out F]
 """
 import argparse
 import glob
@@ -30,15 +30,19 @@ def kl_scores(model, goldens, vocab):
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="qwen2.5-0.5b")
-    ap.add_argument("--golden-dir", default="tests/golden")
+    ap.add_argument("--model", default="qwen3.5-0.8b")
+    ap.add_argument("--golden-dir", default=None, help="HF reference logits (default: the model's golden folder)")
     ap.add_argument("--threshold", type=float, default=0.005, help="KL damage (nats) above which a tensor stays INT8")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
     out = a.out or f"configs/quant/{a.model}.json"
+    golden_dir = a.golden_dir or {"qwen3.5-0.8b": "tests/golden_qwen35", "qwen3.5-2b": "tests/golden_qwen35_2b"}[a.model]
+    files = sorted(glob.glob(f"{golden_dir}/*.pt"))
+    if not files:                                                        # else every KL is 0 and nothing is kept INT8
+        sys.exit(f"no goldens in {golden_dir}; run scripts/golden_qwen35.py")
     eng = load_engine(a.model, "mps")                                    # bf16 weights on the GPU
     m, vocab = eng.model, eng.tokenizer.vocab_size()
-    goldens = [torch.load(f) for f in sorted(glob.glob(f"{a.golden_dir}/*.pt"))]
+    goldens = [torch.load(f) for f in files]
     base0, base_later = kl_scores(m, goldens, vocab)                      # also fills the resident cache
     keys = [k for k, w in m._cache.items() if isinstance(w, torch.Tensor) and w.ndim == 2
             and w.dtype == torch.bfloat16 and "embed" not in k]
@@ -51,7 +55,7 @@ def main() -> None:
         m._cache[key] = orig
         print(f"\r{n + 1}/{len(keys)} tensors measured", end="", flush=True)
     keep = sorted(k for k, v in damage.items() if max(v["pos0"], v["later"]) > a.threshold)
-    policy = {"model": a.model, "scheme": "int4", "threshold_nats": a.threshold, "reference": a.golden_dir,
+    policy = {"model": a.model, "scheme": "int4", "threshold_nats": a.threshold, "reference": golden_dir,
               "baseline_kl_bf16": {"pos0": round(base0, 4), "later": round(base_later, 4)},
               "keep_int8": keep, "always_int8": ["embed_tokens.weight"],
               "damage": dict(sorted(damage.items(), key=lambda kv: -max(kv[1].values())))}

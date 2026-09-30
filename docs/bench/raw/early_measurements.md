@@ -76,8 +76,8 @@ then 188.6 ms (the linears/rest split). Docs quote "186–189 ms".
 ```
 PASS  real uvicorn: a non-streaming request whose client gave up is cancelled (29 of 400 tokens made), blocks freed
 ```
-The W17 archived run printed 43 of 400; the re-run on the server-gap code printed 45, and the run now archived in
-`tests/test_server.txt` (after the deployment fixes, 2026-09-30) printed 44.
+The W17 archived run printed 43 of 400; the re-run on the server-gap code printed 45, and the last Qwen2.5 run, archived
+in `tests/2026-09-30-with-qwen2.5/test_server.txt` (after the deployment fixes, 2026-09-30), printed 44.
 
 ## Container smoke tests (2026-09-28, transcribed from the session)
 

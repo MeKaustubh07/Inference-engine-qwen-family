@@ -1,0 +1,33 @@
+PASS  silu_mul max|diff|=0.0e+00
+PASS  rms_norm T=1 max|diff|=3.0e-08
+PASS  rms_norm T=7 max|diff|=1.2e-07
+PASS  rms_norm T=64 max|diff|=1.2e-07
+PASS  rope H=14 positions up to 4: relative max|diff|=7.6e-08
+PASS  rope H=2 positions up to 31999: relative max|diff|=9.2e-08
+PASS  matvec 896x896 +bias: rel diff 1.7e-07 | cold weights: ours 33 us (49 GB/s) vs torch 60 us
+PASS  matvec 128x896 +bias: rel diff 2.3e-07 | cold weights: ours 14 us (17 GB/s) vs torch 35 us
+PASS  matvec 4864x896: rel diff 1.5e-07 | cold weights: ours 130 us (67 GB/s) vs torch 170 us
+PASS  matvec 896x4864: rel diff 2.6e-07 | cold weights: ours 149 us (59 GB/s) vs torch 163 us
+PASS  matvec 151936x896: rel diff 1.6e-07 | cold weights: ours 3139 us (87 GB/s) vs torch 3129 us
+PASS  gemm T=7 896x896: rel diff 1.2e-06 | tiled 107 us (0.10 TFLOP/s) vs torch 49 us
+PASS  gemm T=64 4864x896: rel diff 0.0e+00 | tiled 1925 us (0.29 TFLOP/s) vs torch 502 us
+PASS  gemm T=256 896x4864: rel diff 0.0e+00 | tiled 7665 us (0.29 TFLOP/s) vs torch 1831 us
+PASS  gemm T=1024 1152x896: rel diff 0.0e+00 | tiled 7241 us (0.29 TFLOP/s) vs torch 1684 us
+PASS  matvec + fused residual: rel diff 2.0e-07
+PASS  fused swiglu: rel diff 2.0e-07 | fused 206 us vs 3 separate kernels 213 us
+PASS  attention_decode S=1 q-scale 1: max|diff|=0.0e+00 | ours 12 us vs torch ops 89 us
+PASS  attention_decode S=5 q-scale 1: max|diff|=2.4e-07 | ours 12 us vs torch ops 91 us
+PASS  attention_decode S=300 q-scale 1: max|diff|=1.0e-07 | ours 35 us vs torch ops 108 us
+PASS  attention_decode S=2048 q-scale 1: max|diff|=6.2e-08 | ours 153 us vs torch ops 611 us
+PASS  attention_decode S=300 q-scale 30: max|diff|=1.2e-05 | ours 37 us vs torch ops 133 us
+PASS  attention_decode S=2048 q-scale 30: max|diff|=9.8e-06 | ours 154 us vs torch ops 608 us
+      prompt 0: prefill top-1 agreement 100%; greedy matches HF for 10/10 tokens -> ' Paris. It is the largest city in Europe and'
+      prompt 1: prefill top-1 agreement 100%; greedy matches HF for 10/10 tokens -> "! I'm trying to create a program that can"
+      prompt 2: prefill top-1 agreement 100%; greedy matches HF for 10/10 tokens -> ' \n    if n <= 1: \n       '
+      prompt 3: prefill top-1 agreement 100%; greedy matches HF for 10/10 tokens -> ' How many times does the word "fox" appear'
+      prompt 4: prefill top-1 agreement 100%; greedy matches HF for 10/10 tokens -> ' He has a dataset of 1000'
+PASS  Metal model: at most 1 near-tie top-1 flip per prompt vs HF fp32 (flips per prompt: [0, 0, 0, 0, 0])
+PASS  Metal model: greedy decode matches HF fp32 for 50/50 tokens (bf16 may diverge late)
+PASS  lock_in_memory: 256 MiB locked for 4 x 64 MiB MPS tensors (+ a view of one); user wire count of their memory [0, 0, 0, 0] -> [1, 1, 1, 1] -> [0, 0, 0, 0] after unlock; GPU results unchanged
+
+26/26 kernel checks passed

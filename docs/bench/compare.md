@@ -1,7 +1,8 @@
 # Qwen3.5-2B on an M2 Air: this engine vs llama.cpp vs MLX-LM
 
 All numbers measured on one MacBook Air M2 (Mac14,2: 8-core GPU, 4P+4E CPU, 8 GB, ~100 GB/s), one engine in
-memory at a time, VS Code and other heavy apps closed. Raw tool output: `docs/bench/raw/`.
+memory at a time, VS Code and other heavy apps closed. Raw tool output: `docs/bench/raw/`. The GGUF and MLX files are
+no longer kept locally (removed 2026-09-30); to reproduce, download them again from the repositories named below.
 
 | engine | version | weights | language-model weights (decimal GB) |
 |---|---|---|---:|

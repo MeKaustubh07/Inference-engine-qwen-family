@@ -13,7 +13,7 @@ class SamplingParams:
     temperature: float = 0.7        # <1 sharpens the distribution, >1 flattens it; 0 means greedy
     top_k: int = 20                 # keep only the k most likely tokens (0 = off)
     top_p: float = 0.8              # keep the smallest set whose probabilities add up to p (1.0 = off)
-    repetition_penalty: float = 1.1 # >1 discourages tokens that already appeared (1.0 = off)
+    repetition_penalty: float = 1.0 # >1 discourages tokens that already appeared (1.0 = off; Qwen3.5's setting)
     seed: int | None = None
 
 

@@ -1,5 +1,7 @@
 # Weight quantization (INT8 / INT4) on Qwen2.5-0.5B
 
+Measured on Qwen2.5-0.5B, the bring-up model, removed 2026-09-30 (last present at `4f9581b`); kept as history.
+
 ### metal-kernels-bf16 — Qwen2.5-0.5B, 32 new tokens, M2 8 GB
 
 Weights resident: 0.99 GB → bandwidth ceiling ≈ 101 tok/s (every decode step reads every weight once at ~100 GB/s).
@@ -60,7 +62,7 @@ Reference: HF fp32 goldens. Perplexity on a fixed 70-token paragraph; KL and top
 | 0.002 | 37 | 0.437 GB | 0.084 | 94% |
 | 0.001 | 62 | 0.497 GB | 0.035 | 98% |
 
-The policy lives in `configs/quant/qwen2.5-0.5b.json` (names are fused tensors: `qkv`, `gate_up`; every component of a fused tensor gets the same scheme).
+The policy was `configs/quant/qwen2.5-0.5b.json` (names are fused tensors: `qkv`, `gate_up`; every component of a fused tensor gets the same scheme); the file, with its calibration data, is now `docs/bench/raw/quant_policy_qwen2.5-0.5b.json`.
 
 ## Speed
 

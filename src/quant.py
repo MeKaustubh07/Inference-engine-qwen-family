@@ -75,7 +75,7 @@ def quantize(w: torch.Tensor, scheme: str, block: int = BLOCK) -> QuantTensor:
 
 _GROUPS = [  # checkpoint component / model fused-tensor suffix -> the fused group it belongs to
     (("self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight",
-      "self_attn.qkv.weight", "self_attn.qkvg.weight"), "attn_in"),
+      "self_attn.qkvg.weight"), "attn_in"),
     (("mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.gate_up.weight"), "mlp_in"),
     (("linear_attn.in_proj_qkv.weight", "linear_attn.in_proj_z.weight", "linear_attn.in_proj_b.weight",
       "linear_attn.in_proj_a.weight", "linear_attn.in_proj.weight"), "linear_in"),
@@ -85,9 +85,9 @@ _GROUPS = [  # checkpoint component / model fused-tensor suffix -> the fused gro
 def policy_group(name: str) -> str:
     """Canonical id for policy matching, independent of model family and checkpoint prefix.
 
-    'model.layers.3.self_attn.k_proj.weight' (Qwen2 checkpoint), 'layers.3.self_attn.qkvg.weight' (Qwen3.5 fused)
-    and 'model.language_model.layers.3.self_attn.q_proj.weight' all map to 'layers.3.attn_in', so every part of
-    one fused matrix gets the same scheme (row-stacking needs that)."""
+    'model.language_model.layers.3.self_attn.k_proj.weight' (checkpoint) and 'layers.3.self_attn.qkvg.weight'
+    (fused) both map to 'layers.3.attn_in', so every part of one fused matrix gets the same scheme (row-stacking
+    needs that)."""
     i = name.find("layers.")
     base = name[i:] if i >= 0 else name
     for suffixes, group in _GROUPS:
@@ -95,11 +95,6 @@ def policy_group(name: str) -> str:
             if base.endswith(suf):
                 return base[: -len(suf)] + group
     return base
-
-
-def fused_name(name: str) -> str:
-    """Kept for compatibility: canonical group id (see policy_group)."""
-    return policy_group(name)
 
 
 def scheme_for(name: str | None, scheme: str, keep_int8: frozenset = frozenset()) -> str:

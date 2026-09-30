@@ -26,7 +26,7 @@ against Hugging Face `transformers`.
                         │  waiting → admit (KV budget) → packed chunked prefill → batched decode + sampling
                         │  tokens flow back via AsyncSink (call_soon_threadsafe), no thread per request
                         ▼
-                      Model: Qwen35Model / Qwen2Model                    src/models/
+                      Model: Qwen35Model                                 src/models/
                         │  forward(ids, state)      prefill, chunked DeltaNet (WY form, chunk 64)
                         │  forward_packed(chunks)   several sequences' prompt chunks in one pass
                         │  decode_batch(tokens, states)   B sequences, one pass over the weights
@@ -45,7 +45,7 @@ against Hugging Face `transformers`.
 |---|---|---|
 | loader | `src/weight_loader.py` | parse the safetensors header, mmap the file, hand out zero-copy bf16 tensor views |
 | tokenizer | `src/tokenizer.py` | byte-level BPE from `tokenizer.json` (GPT-2 byte alphabet, merge ranks, special tokens first, NFC) |
-| chat template | `src/chat.py` | Qwen2.5 and Qwen3.5 ChatML, including Qwen3.5 thinking-mode rules |
+| chat template | `src/chat.py` | Qwen3.5 ChatML incl. thinking-mode rules (unknown styles raise) |
 | model | `src/models/qwen3_5.py` | hybrid layers, fused projections, partial RoPE, output gate, DeltaNet prefill and decode |
 | state | `src/state.py` | contiguous and paged KV caches, block allocator, `HybridState` |
 | kernels | `src/kernels/*.metal` | matvec (bf16, INT8, INT4, batched), RMSNorm, RoPE, decode attention, DeltaNet step, SwiGLU |
@@ -165,19 +165,19 @@ the same route above 32 rows, so a prompt packed with others keeps fp32 activati
 ## 7. Correctness strategy
 
 - **Answer key**: HF `transformers` dumps activations through forward hooks, plus 10 greedy tokens per prompt.
-  Qwen2.5-0.5B (fp32, CPU, default attention; 5 prompts): embedding, layer-0 intermediates, final norm, logits.
+  The bring-up model, Qwen2.5-0.5B, was checked at layer-0 granularity (block ≤ 3.3e-5, logits ≤ 3e-4, greedy ==
+  HF); it was removed on 2026-09-30, and its test outputs are in `docs/bench/raw/tests/2026-09-30-with-qwen2.5/`.
   Qwen3.5 (eager attention; 7 prompts including Hindi and a 126-token prompt that crosses the 64-token DeltaNet
   chunk boundary): embedding, every layer output, final norm, logits; fp32 for 0.8B, bf16 for 2B, whose fp32
   weights (~7.5 GB) do not fit.
 - **Tolerances are relative to magnitude**. Qwen3.5-0.8B: every layer ≤ 1e-4 relative, logits ≤ 1e-3 absolute,
-  top-1 100%, greedy text identical. Qwen2.5-0.5B: layer-0 attention and block ≤ 1e-3 × max(1, scale), logits ≤ 1e-2
-  absolute (measured: block ≤ 3.3e-5, logits ≤ 3e-4), top-1 100%, greedy == HF.
+  top-1 100%, greedy text identical.
 - **bf16 and quantized paths are judged on tokens**: KL divergence against the reference and top-1 flips only at
   positions where the top-2 gap is above bf16 noise.
 - **Invariants**: cached == uncached; paged == contiguous; batched == sequential (greedy tokens identical, logits
   within 6e-5 in fp32 on the CPU; bit-identical in bf16 on Metal); preempted == uninterrupted; fused kernels ==
   reference ops; batched kernels == per-row kernels.
-- `scripts/run_tests.py` runs all 14 suites and exits nonzero on any failure.
+- `scripts/run_tests.py` runs all 11 suites and exits nonzero on any failure.
 
 ## 8. Operations
 
@@ -198,7 +198,7 @@ the same route above 32 rows, so a prompt packed with others keeps fp32 activati
 |---|---|---|
 | a Mac (M-series), native | Metal INT4 | `scripts/serve.py` as a launchd service (below); best performance; expose with a reverse proxy or a tunnel (Tailscale / Cloudflare Tunnel) |
 | cloud Apple silicon | Metal INT4 | AWS EC2 Mac (mac2.metal = M1, mac2-m2.metal = M2) or Scaleway Apple silicon; same launchd setup |
-| Linux container | CPU fp32 (TorchBackend) | `Dockerfile` (1.37 GB image); tested in Docker Desktop's 4 GB VM: Qwen2.5-0.5B at ~4 tok/s, healthcheck, graceful stop; Qwen3.5-0.8B pages in 4 GB (≥ 6 GB suggested, untested); Docker on a Mac cannot reach the Apple GPU |
+| Linux container | CPU fp32 (TorchBackend) | `Dockerfile` (1.37 GB image); default Qwen3.5-0.8B in fp32 (~3.5 GB peak): it pages in Docker Desktop's 4 GB VM (3.54 of 3.83 GiB, 6 tokens in 114 s), so give the VM ≥ 6 GB (not yet measured); the healthcheck and graceful stop were verified with the previous default, Qwen2.5-0.5B (~4 tok/s, since removed); Docker on a Mac cannot reach the Apple GPU |
 
 A container cannot use Metal: Docker Desktop on macOS runs Linux in a VM with no Apple GPU. The GPU deployment is
 therefore a native process; its "container" is a pinned venv plus a launchd service (not included in the repo;

@@ -1,4 +1,4 @@
-"""Weeks 9-10: every Metal kernel vs the torch reference op, micro-benchmarks, then the model end to end."""
+"""Weeks 9-10: every Metal kernel vs the torch reference op at Qwen3.5-0.8B shapes, micro-benchmarks, weight locking."""
 import sys
 import time
 import torch
@@ -24,27 +24,35 @@ def bench(fn, iters=200):
     for _ in range(iters): fn()
     torch.mps.synchronize(); return (time.perf_counter() - t0) / iters * 1e6   # microseconds
 
-# silu_mul
-g, u = torch.randn(1, 4864, device=dev), torch.randn(1, 4864, device=dev)
+# silu_mul (the MLP width of Qwen3.5-0.8B)
+g, u = torch.randn(1, 3584, device=dev), torch.randn(1, 3584, device=dev)
 check(f"silu_mul max|diff|={maxdiff(mb.silu_mul(g, u), ops.silu_mul(g, u)):.1e}", maxdiff(mb.silu_mul(g, u), ops.silu_mul(g, u)) < 1e-5)
 
-# rms_norm, several row counts (decode row and a prefill block)
-w = (torch.randn(896) * 0.1).to(torch.bfloat16).to(dev)
-for T in (1, 7, 64):
-    x = torch.randn(T, 896, device=dev) * 3
+# rms_norm with fp32 weights (Qwen3.5 stores 1 + w in fp32): hidden rows (decode row and prefill blocks) and the
+# per-head q/k norms; plus one row through the bf16-weight kernel
+for shape in ((1, 1024), (7, 1024), (64, 1024), (7, 8, 256), (7, 2, 256)):
+    w = 1 + torch.randn(shape[-1], device=dev) * 0.1
+    x = torch.randn(*shape, device=dev) * 3
     d = maxdiff(mb.rms_norm(x, w, 1e-6), ops.rms_norm(x, w, 1e-6))
-    check(f"rms_norm T={T} max|diff|={d:.1e}", d < 1e-4)
+    check(f"rms_norm (fp32 weights) x{list(shape)} max|diff|={d:.1e}", d < 1e-4)
+w = (torch.randn(1024) * 0.1).to(torch.bfloat16).to(dev)
+x = torch.randn(7, 1024, device=dev) * 3
+d = maxdiff(mb.rms_norm(x, w, 1e-6), ops.rms_norm(x, w, 1e-6))
+check(f"rms_norm (bf16 weights) T=7 max|diff|={d:.1e}", d < 1e-4)
 
-# rope: queries (14 heads) and keys (2 heads), large positions too
-for H, pos in ((14, torch.arange(5)), (2, torch.tensor([0, 1, 700, 4095, 31999]))):
-    x = torch.randn(len(pos), H, 64, device=dev) * 50
-    ours, ref = mb.rope(x, pos.to(dev), 1e6), ops.rope(x, pos.to(dev), 1e6)
+# rope on the rotary slice (8 query + 2 key heads, first 64 of 256 dims), large positions too
+for pos in (torch.arange(5), torch.tensor([0, 1, 700, 4095, 31999])):
+    x = torch.randn(len(pos), 10, 64, device=dev) * 50
+    ours, ref = mb.rope(x, pos.to(dev), 1e7), ops.rope(x, pos.to(dev), 1e7)
     rel = maxdiff(ours, ref) / ref.abs().max().item()
-    check(f"rope H={H} positions up to {int(pos.max())}: relative max|diff|={rel:.1e}", rel < 1e-4)
+    check(f"rope H=10 positions up to {int(pos.max())}: relative max|diff|={rel:.1e}", rel < 1e-4)
 
-# matvec: every projection shape in the model, with and without bias, plus the 151,936-row output head
-for N, K, bias in ((896, 896, True), (128, 896, True), (4864, 896, False), (896, 4864, False), (151936, 896, False)):
-    W = (torch.randn(N, K) * 0.05).to(torch.bfloat16).to(dev)
+# matvec: every projection shape in Qwen3.5-0.8B (qkvg, o_proj/out_proj, DeltaNet in_proj, gate_up, down) plus the
+# 248,320-row output head, and one synthetic 896x896 +bias row (the bias path, and K % 256 = 128: every Qwen3.5 K is
+# a multiple of 256). Weights are made on the GPU in bf16: an fp32 CPU copy of the head would be 1 GB of temporaries.
+for N, K, bias in ((5120, 1024, False), (1024, 2048, False), (8224, 1024, False), (7168, 1024, False),
+                   (1024, 3584, False), (248320, 1024, False), (896, 896, True)):
+    W = torch.randn(N, K, device=dev, dtype=torch.bfloat16) * 0.05
     b = (torch.randn(N) * 0.1).to(torch.bfloat16).to(dev) if bias else None
     x = torch.randn(1, K, device=dev)
     ref = (x @ W.float().T) + (b.float() if bias else 0)
@@ -59,9 +67,10 @@ for N, K, bias in ((896, 896, True), (128, 896, True), (4864, 896, False), (896,
     t_torch = bench(lambda: torch_lin(Ws[next(it) % len(Ws)]), 2 * len(Ws))                 # same work as TorchBackend.linear
     gbps = N * K * 2 / (t_ours * 1e-6) / 1e9
     check(f"matvec {N}x{K}{' +bias' if bias else ''}: rel diff {rel:.1e} | cold weights: ours {t_ours:.0f} us ({gbps:.0f} GB/s) vs torch {t_torch:.0f} us", rel < 1e-3)
+del Ws, W, ref; torch.mps.empty_cache()
 
 # tiled GEMM (prefill) vs PyTorch's tuned GEMM, including ragged sizes not divisible by the tile
-for T, N, K in ((7, 896, 896), (64, 4864, 896), (256, 896, 4864), (1024, 1152, 896)):
+for T, N, K in ((7, 5120, 1024), (64, 7168, 1024), (256, 1024, 3584), (1024, 8224, 1024)):
     W = (torch.randn(N, K) * 0.05).to(torch.bfloat16).to(dev); x = torch.randn(T, K, device=dev)
     ref = x @ W.float().T
     rel = maxdiff(mb.gemm(x, W), ref) / ref.abs().max().item()
@@ -69,47 +78,43 @@ for T, N, K in ((7, 896, 896), (64, 4864, 896), (256, 896, 4864), (1024, 1152, 8
     tflops = 2 * T * N * K / (t_ours * 1e-6) / 1e12
     check(f"gemm T={T} {N}x{K}: rel diff {rel:.1e} | tiled {t_ours:.0f} us ({tflops:.2f} TFLOP/s) vs torch {t_torch:.0f} us", rel < 1e-3)
 
-# fused kernels: matvec + residual, and SwiGLU (gate and up rows read in one pass)
-W = (torch.randn(896, 4864) * 0.05).to(torch.bfloat16).to(dev); x = torch.randn(1, 4864, device=dev); r = torch.randn(1, 896, device=dev)
+# fused kernels: matvec + residual (down_proj), and SwiGLU (gate and up rows read in one pass)
+W = (torch.randn(1024, 3584) * 0.05).to(torch.bfloat16).to(dev); x = torch.randn(1, 3584, device=dev); r = torch.randn(1, 1024, device=dev)
 ref = x @ W.float().T + r
 check(f"matvec + fused residual: rel diff {maxdiff(mb.linear(x, W, residual=r), ref) / ref.abs().max().item():.1e}",
       maxdiff(mb.linear(x, W, residual=r), ref) / ref.abs().max().item() < 1e-3)
-Wgu = (torch.randn(2 * 4864, 896) * 0.05).to(torch.bfloat16).to(dev); x = torch.randn(1, 896, device=dev)
-yg = x @ Wgu.float().T; ref = ops.silu_mul(yg[:, :4864], yg[:, 4864:])
+Wgu = (torch.randn(2 * 3584, 1024) * 0.05).to(torch.bfloat16).to(dev); x = torch.randn(1, 1024, device=dev)
+yg = x @ Wgu.float().T; ref = ops.silu_mul(yg[:, :3584], yg[:, 3584:])
 rel = maxdiff(mb.swiglu(x, Wgu), ref) / ref.abs().max().item()
-t_fused = bench(lambda: mb.swiglu(x, Wgu)); t_split = bench(lambda: mb.silu_mul(mb.linear(x, Wgu[:4864]), mb.linear(x, Wgu[4864:])))
+t_fused = bench(lambda: mb.swiglu(x, Wgu)); t_split = bench(lambda: mb.silu_mul(mb.linear(x, Wgu[:3584]), mb.linear(x, Wgu[3584:])))
 check(f"fused swiglu: rel diff {rel:.1e} | fused {t_fused:.0f} us vs 3 separate kernels {t_split:.0f} us", rel < 1e-3)
 
-# decode attention: 1 query, S cached positions, 14 query heads sharing 2 KV heads
-for S, scale in ((1, 1), (5, 1), (300, 1), (2048, 1), (300, 30), (2048, 30)):
+# decode attention: 1 query, S cached positions, 8 query heads sharing 2 KV heads of 256 dims. The kernel splits its
+# value pass into 256/d groups plus a reduction: 1 group at d=256, so one d=64 case (14/2 heads) keeps 4 covered.
+for S, scale, Hq, d in ((1, 1, 8, 256), (5, 1, 8, 256), (300, 1, 8, 256), (2048, 1, 8, 256), (300, 30, 8, 256),
+                        (2048, 30, 8, 256), (300, 30, 14, 64)):
     # scale 30 pushes scores past exp()'s fp32 range: only a correct max-subtracting softmax stays finite
-    q = torch.randn(1, 14, 64, device=dev) * scale; k = torch.randn(S, 2, 64, device=dev); v = torch.randn(S, 2, 64, device=dev)
-    d = maxdiff(mb.attention(q, k, v), ops.attention(q, k, v, causal=True))
+    q = torch.randn(1, Hq, d, device=dev) * scale; k = torch.randn(S, 2, d, device=dev); v = torch.randn(S, 2, d, device=dev)
+    diff = maxdiff(mb.attention(q, k, v), ops.attention(q, k, v, causal=True))
     t_ours = bench(lambda: mb.attention(q, k, v), 100); t_torch = bench(lambda: ops.attention(q, k, v, causal=True), 100)
-    check(f"attention_decode S={S} q-scale {scale}: max|diff|={d:.1e} | ours {t_ours:.0f} us vs torch ops {t_torch:.0f} us", d < 1e-4)
+    check(f"attention_decode S={S} q-scale {scale} d={d}: max|diff|={diff:.1e} | ours {t_ours:.0f} us vs torch ops {t_torch:.0f} us", diff < 1e-4)
 
-# end to end: the whole model on the Metal backend
-from config import ModelConfig
-from generate import generate_greedy
-from models.qwen2 import Qwen2Model
-from tokenizer import Tokenizer
-from weight_loader import SafetensorsFile
-D = "models/qwen2.5-0.5b"
-model = Qwen2Model(ModelConfig.from_json(f"{D}/config.json"), SafetensorsFile(f"{D}/model.safetensors"), mb)
-tok = Tokenizer(f"{D}/tokenizer.json")
-agree_all, flips, match = [], [], 0
-for i in range(5):
-    gd = torch.load(f"tests/golden/{i}.pt")
-    lg = model.forward(gd["ids"]).cpu()
-    same = lg.argmax(-1) == gd["logits"].argmax(-1)
-    agree_all.append(same.float().mean().item()); flips.append(int((~same).sum()))
-    ours = generate_greedy(model, tok, gd["text"], 10, {151643, 151645})
-    hf = gd["greedy"].tolist()
-    n = next((j for j, (a, b) in enumerate(zip(ours, hf)) if a != b), min(len(ours), len(hf)))
-    match += n
-    print(f"      prompt {i}: prefill top-1 agreement {agree_all[-1]:.0%}; greedy matches HF for {n}/10 tokens -> {tok.decode(ours)!r}")
-check(f"Metal model: at most 1 near-tie top-1 flip per prompt vs HF fp32 (flips per prompt: {flips})", max(flips) <= 1)
-check(f"Metal model: greedy decode matches HF fp32 for {match}/50 tokens (bf16 may diverge late)", match >= 35)
+# paged decode attention: 5 sequences of different lengths in one dispatch, each reading its keys/values in place
+# through a scrambled block table, vs the reference gather-then-attend (TorchBackend on MPS, fp32)
+from backend.torch_ref import TorchBackend
+rb = TorchBackend("mps", torch.float32)
+lens_l, bs = [1, 7, 16, 33, 300], 16
+perm = torch.randperm(32).tolist()
+nbs = [-(-n // bs) for n in lens_l]
+tabs = [perm[sum(nbs[:i]):sum(nbs[:i + 1])] for i in range(len(lens_l))]
+tables = torch.tensor([t + [0] * (max(nbs) - len(t)) for t in tabs], dtype=torch.int32, device=dev)
+lens = torch.tensor(lens_l, dtype=torch.int32, device=dev)
+for Hq, Hkv, d in ((8, 2, 256), (14, 2, 64)):
+    kp, vp = torch.randn(32, bs, Hkv, d, device=dev), torch.randn(32, bs, Hkv, d, device=dev)
+    q = torch.randn(len(lens_l), Hq, d, device=dev)
+    diff = maxdiff(mb.paged_attention(q, kp, vp, tables, lens, bs), rb.paged_attention(q, kp, vp, tables, lens, bs))
+    check(f"paged_attention_decode B=5 lengths {lens_l}, block size {bs}, scrambled tables, {Hq}/{Hkv} heads d={d}: "
+          f"max|diff|={diff:.1e}", diff < 1e-4)
 
 # weights locked in RAM (backend/pinning.py): mlock of the MTLBuffer pages behind MPS tensors. The kernel's user wire
 # count on the buffers' memory must go to 1 and back to 0 after unlock, and the GPU must still read the same data.

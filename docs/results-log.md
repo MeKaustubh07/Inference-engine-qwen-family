@@ -3,7 +3,8 @@
 The raw material for the project write-up: what was measured at each step, what it showed, and what was decided.
 Hardware throughout: MacBook Air M2 (Mac14,2: 4P+4E CPU, 8-core GPU), 8 GB unified memory, ~100 GB/s. Commits
 are in `git log`; detailed tables live in `docs/bench/` (raw tool output in `docs/bench/raw/`, test output in
-`docs/bench/raw/tests/`, numbers first recorded in working notes in `docs/bench/raw/early_measurements.md`).
+`docs/bench/raw/tests/`, the last run with Qwen2.5-0.5B in `docs/bench/raw/tests/2026-09-30-with-qwen2.5/`, numbers
+first recorded in working notes in `docs/bench/raw/early_measurements.md`).
 
 ## Phase 0 — TypeScript on Node (Aug 30 – Sep 5, commits `bd2b183`, `a3d84d0`)
 
@@ -28,9 +29,9 @@ core to Python + PyTorch (bf16 native, a route to hand-written Metal kernels, sa
 |---|---|---|
 | W1 loader | `2f11d14` | mmap + zero-copy bf16 views: open 7 ms, 4/4 integrity checks, peak RSS 215 MB (vs ~3 GB in TS) |
 | W2 tokenizer | `e12611d` | byte-level BPE, 51/51 identical to HF `tokenizers` |
-| W3 embedding, RMSNorm | `40f4c66` | embedding exact (diff 0), RMSNorm ≤ 2.4e-7 vs HF fp32 (`raw/early_measurements.md`, `raw/tests/test_ops.txt`) |
-| W4 block | `8e74eb4` | RoPE q/k 1.3e-4/1.8e-4 abs (keys reach 130: ~1e-6 relative); layer-0 attention ≤ 4e-6; full block ≤ 3.3e-5 (`raw/early_measurements.md`, `raw/tests/test_block.txt`) |
-| W5 model | `390685e` | 24 layers, logits ≤ 3e-4 vs HF; greedy continuation "Paris" (`raw/tests/test_model.txt`) |
+| W3 embedding, RMSNorm | `40f4c66` | embedding exact (diff 0), RMSNorm ≤ 2.4e-7 vs HF fp32 (`raw/early_measurements.md`, `raw/tests/2026-09-30-with-qwen2.5/test_ops.txt`) |
+| W4 block | `8e74eb4` | RoPE q/k 1.3e-4/1.8e-4 abs (keys reach 130: ~1e-6 relative); layer-0 attention ≤ 4e-6; full block ≤ 3.3e-5 (`raw/early_measurements.md`, `raw/tests/2026-09-30-with-qwen2.5/test_block.txt`) |
+| W5 model | `390685e` | 24 layers, logits ≤ 3e-4 vs HF; greedy continuation "Paris" (`raw/tests/2026-09-30-with-qwen2.5/test_model.txt`) |
 | W6 sampling, chat, REPL | `c907515` | ChatML template identical to HF; top-k/top-p/temperature/repetition as HF's warpers |
 | W6 review | `88555fe` | review workflow: 9 confirmed defects (top-p boundary, padding ids sampled, stream tail) fixed; greedy == HF `generate()` token for token on 5 prompts |
 
@@ -63,7 +64,7 @@ Details: `docs/bench/decode.md`, `docs/bench/quant.md`.
 | fused DeltaNet decode kernels | `c8ac5c8` | 17 → 46 tok/s (0.8B, bf16) |
 | tokenizer finding | `c8ac5c8` | HF `AutoTokenizer` resolves this checkpoint to `Qwen2Tokenizer` (older regex, splits combining marks); the engine follows `tokenizer.json` |
 | review fixes | `4b31841` | exact chat-template rules, 7 missing special tokens, atomic state reservation; goldens with 57- and 126-token prompts (only the 126-token one crosses the 64-token chunk; the commit message says both) |
-| 0.8B suite (7 prompts) | | worst layer 3.8e-6 relative, logits ≤ 6.4e-5, top-1 100%, greedy 70/70 = HF; paged hybrid state == uncached (4.3e-5) (`raw/tests/test_qwen35.txt`) |
+| 0.8B suite (7 prompts) | | worst layer 3.8e-6 relative, logits ≤ 6.4e-5, top-1 100%, greedy 70/70 = HF; paged hybrid state == uncached (4.3e-5) (`raw/tests/2026-09-30-with-qwen2.5/test_qwen35.txt`) |
 | Qwen3.5-2B bf16 vs HF bf16 | `32de01f` | KL 0.0004, 0/190 top-1 flips, greedy 64/70 (one divergence at a 0.015-logit near-tie) |
 | 2B INT8 | `32de01f` | 2.00 GB, KL 0.0007, 0 flips, greedy 70/70 |
 | 2B INT4 (5 tensors kept INT8) | `32de01f` | 1.41 GB, KL 0.045, 3/190 flips, answers "Paris" |
@@ -103,7 +104,7 @@ Details: `docs/bench/decode.md`, `docs/bench/quant.md`.
 | profile of a server decode step, batch 8 (timers around the scheduler's methods + GPU synchronize) | HTTP 84.1 ms = 69.2 GPU + 4.1 issue + 8.8 sampling + 0.2 emit + 1.7 rest; in-process 79.4. **The ~28 ms did not reproduce**: the last-admitted request of an 8-client wave decoded at 77–90 ms/token in 9 re-measured runs vs 108–110 on 2026-09-28, a run slower at 4 and 8 clients (cause not established). Gap to 116 tok/s in the final A/B's before-runs (104 vs 69 ms per 8 tokens): ~27 ms one-at-a-time prefill (~1.7 s per wave, ~0.21 s per prompt), ~9 ms per-step work (steps ~78 vs 69 ms; mostly sampling, 8.8 ms in the profiled run): **about three quarters prefill** |
 | prefill time vs prompt length, one forward | T = 1 / 23 / 184 / 256: 26 / 222 / 542 / 676 ms: prefill grows slowly with length (23 tokens cost 41% of 184); up to 32 rows the batched kernels re-read every weight once per 8 rows, above 32 the fp32 expansion + GEMM starts high and grows slowly (linears 184 ms at 33 rows, 194 at 64, 336 at 184) |
 | packed prefill (`forward_packed`) vs each prompt alone | max \|Δlogit\| 2.9e-6 INT4 Metal, 0 bf16 Metal, ≤ 2.7e-5 fp32 CPU; 43-token packs (GEMM path) ≤ 2.9e-5 |
-| bf16 weights above 32 rows: fp32 GEMM instead of bf16 activations (so packing does not change a prompt's numerics) | Qwen2.5-0.5B bf16 perplexity 11.336 → 11.350 (`raw/tests/test_quant.txt`); Qwen3.5-2B bf16 vs HF unchanged except one near-tie gap 0.015 → 0.019 |
+| bf16 weights above 32 rows: fp32 GEMM instead of bf16 activations (so packing does not change a prompt's numerics) | Qwen2.5-0.5B bf16 perplexity 11.336 → 11.350 (`raw/tests/2026-09-30-with-qwen2.5/test_quant.txt`); Qwen3.5-2B bf16 vs HF unchanged except one near-tie gap 0.015 → 0.019 |
 | first load test of packed + chunked prefill | no clear win: 72.3 tok/s at 8 (that session's baseline 77.0); in the server log each 8-client wave's first request was prefilled alone (~20 tokens) and the other 7, arriving a few ms later, together (~155 tokens); that request then ran a step ahead, so the next wave split the same way → **batching window** (default 5 ms, twice that at most) |
 | batched sampling with the selection on MPS | saved nothing: 8.8 → 8.4 ms per batch-8 step (HTTP) |
 | why: `torch.topk` over 8 × 248,320 | **MPS 4.5 ms for any k (1–64), CPU 1.0 ms**; copying the batch's logits to the CPU 0.48 ms (0.99 for the strided vocab slice) |
@@ -152,6 +153,25 @@ llama.cpp build 11146 (Homebrew), bartowski GGUFs; MLX-LM 0.31.3, mlx-community 
 
 Load-test and benchmark tables: `docs/bench/serving.md`, `docs/bench/qwen35.md`, `docs/bench/compare.md`.
 
+## Removing the bring-up model and the baselines (2026-09-30)
+
+Disk space for the next model (Aya): the served Qwen3.5-2B and its fp32 reference twin Qwen3.5-0.8B stay, everything
+else goes. `4f9581b` is the last commit with Qwen2.5-0.5B.
+
+| step | result |
+|---|---|
+| removed from disk (never in git) | `models/qwen2.5-0.5b` (1.8 GB), `tests/golden/` (Qwen2.5 HF answer keys, 19 MB), the comparison baselines `models/gguf` (4.5 GB) and `models/qwen3.5-2b-mlx-4bit` (1.6 GB; `docs/bench/compare.md` names their repos): ~7.9 GB |
+| removed from the repo (in git history) | `src/models/qwen2.py`, `src/inspect_model.py` (its loader integrity check moved to `test_qwen35`), `scripts/golden_layers.py`, `tests/golden_tokens.json`; suites `test_ops`, `test_block`, `test_model`, which only covered the Qwen2 bring-up (`test_qwen35` checks every Qwen3.5 layer, the final norm and the logits against HF fp32) |
+| moved | Qwen2.5 INT4 policy and its calibration data → `raw/quant_policy_qwen2.5-0.5b.json`; the last run of the 14 suites → `raw/tests/2026-09-30-with-qwen2.5/` |
+| ported to Qwen3.5-0.8B | `test_tokenizer` (+ the 2B's tokenizer files byte-equal to the 0.8B's), `test_sampling`, `test_cache` (hybrid byte accounting; 1- and 2-token prefills from an empty DeltaNet state; MPS fp32/bf16 and Metal, 57 tokens on Metal), `test_paged` (running out of blocks or DeltaNet state slots), `test_kernels` (0.8B shapes, d = 256 decode attention, the paged-attention kernel, fp32-weight RMSNorm), `test_quant`, `test_server` (HTTP/scheduler checks on the hybrid model; UTF-8 holdback fed a split emoji), `test_prefill`; `test_qwen35` also checks Metal prefill top-1 at non-tied positions |
+| first run after the removal | 11 suites, 220 checks passed, 2 failed (`test_quant`: the two INT4 thresholds below); tokenizer 66/66 cases |
+| 0.8B on Metal vs HF fp32 (7 prompts; perplexity on one English paragraph) | bf16 1.51 GB, perplexity 12.855, KL 0.0000, top-1 100%, 0/183 flips at non-tied positions; INT8 0.80 GB, 12.844, KL 0.0013, 96%, 0/183; INT4 0.58 GB, 14.354 (+11.7%), KL 0.215, 87%, 5/183; INT4 + policy (10 tensors INT8) 0.60 GB, 13.856 (+7.8%), KL 0.068, 88%, 1/183 (`raw/tests/test_quant.txt`) |
+| the 2 failures: thresholds re-based | both were set on Qwen2.5-0.5B, where INT4 cost +1.3% perplexity (`raw/tests/2026-09-30-with-qwen2.5/test_quant.txt`). Plain INT4 perplexity bound 5% → 15% of bf16, a regression guard above the measured +11.7%, plus a new check that the calibrated policy lowers it. Calibrated INT4 "mean top-1 agreement ≥ 90%" (88% here, pulled down by near-ties on the 4- and 10-token prompts) → the served 2B's gate: KL < 0.15 and top-1 flips ≤ 10% of non-tied positions (1/183) |
+| full run, archived with `run_tests.py --save` | 11 suites, **223 checks passed**, 440 s (tokenizer 0.3 s, sampling 13.4, cache 76.5, paged 29.2, kernels 9.0, native 2.5, quant 64.3, qwen35 34.0, qwen35_2b 52.3, server 97.2, prefill 61.4) (`raw/tests/run_tests.txt`) |
+| Metal bf16 prefill vs HF fp32 | 0 top-1 flips at the 183 non-tied positions of 218; greedy 70/70 (`raw/tests/test_qwen35.txt`) |
+| cache on bf16 backends (budget: 1.5 × the backend's max logit error vs HF fp32) | MPS bf16 cached vs uncached 0.19 within 0.29, argmax equal at all 8 non-tied positions of 10, greedy 10/10; Metal 0.00 within 0.00 at 10 and 57 tokens (`raw/tests/test_cache.txt`) |
+| Dockerfile default | `qwen3.5-0.8b` on the CPU (was `qwen2.5-0.5b`); needs a VM of ≥ 6 GB, not yet measured |
+
 ## Review workflows run
 
 | week | agents | findings → confirmed | notable |
@@ -171,3 +191,4 @@ Load-test and benchmark tables: `docs/bench/serving.md`, `docs/bench/qwen35.md`,
 | server gap documentation numbers, round 2 | 26 | 30 earlier fixes all hold; 11 new → 8 confirmed, 1 split, all fixed | the "~28 ms" was the 2026-09-28 run's slower steps, not prefill stalls; a breakdown that did not add up |
 | server gap documentation numbers, rounds 3–4 | 52 | 20 → 16 confirmed, then 4 → 3 confirmed; all fixed (after `0ee0f08`) | the gap split mixed two runs (now ~3/4 prefill within one run); the 2026-09-28 run was slow only at 4–8 clients; a prefill total included loadgen's warm-up prompts |
 | deployment fixes (lock, gauges, log reasons) | 31 | 14 → 2 confirmed (the same defect), fixed | the log fix wrote `cancelled` for stop-string completions |
+| removing Qwen2.5 (plan, port, review) | 19 | plan: 5 readers + 1 merge; review: 5 → 2 confirmed, fixed | a pointer to a moved test output; timings cited from an unarchived run (→ `run_tests.py --save`) |

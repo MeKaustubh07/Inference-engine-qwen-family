@@ -35,8 +35,8 @@ load test). Details and methodology: [`docs/bench/compare.md`](docs/bench/compar
 
 | layer | highlights |
 |---|---|
-| models | Qwen2.5-0.5B (bring-up), Qwen3.5-0.8B and Qwen3.5-2B (18 Gated DeltaNet + 6 gated-attention layers) |
-| correctness | vs HF `transformers`: Qwen2.5-0.5B layer-0 block ≤ 3.3e-5 and logits ≤ 3e-4 (fp32), greedy == HF on 5 prompts; Qwen3.5-0.8B every one of 24 layers ≤ 3.8e-6 relative (fp32), greedy identical on 7 prompts incl. Hindi; Qwen3.5-2B vs HF bf16 (fp32 does not fit in 8 GB): KL 0.0004 / 0.0007 / 0.045 for bf16 / INT8 / INT4, greedy 64 / 70 / 47 of 70 tokens, every divergence at a near-tie |
+| models | Qwen3.5-2B (served, INT4) and Qwen3.5-0.8B (same-architecture fp32 reference), 18 Gated DeltaNet + 6 gated-attention layers; Qwen2.5-0.5B was the bring-up model (removed 2026-09-30) |
+| correctness | vs HF `transformers`: bring-up (Qwen2.5-0.5B, removed): layer-0 block ≤ 3.3e-5 and logits ≤ 3e-4 (fp32), greedy == HF on 5 prompts; Qwen3.5-0.8B every one of 24 layers ≤ 3.8e-6 relative (fp32), greedy identical on 7 prompts incl. Hindi; Qwen3.5-2B vs HF bf16 (fp32 does not fit in 8 GB): KL 0.0004 / 0.0007 / 0.045 for bf16 / INT8 / INT4, greedy 64 / 70 / 47 of 70 tokens, every divergence at a near-tie |
 | state | paged KV cache (block allocator, block tables) + fixed-size DeltaNet recurrent/conv state per sequence |
 | kernels (MSL) | bf16/INT8/INT4 matvec (+ batched), paged attention, batched DeltaNet step, RMSNorm, RoPE, fused SwiGLU, INT4/INT8 → fp32 expansion |
 | quantization | block-32 INT8, asymmetric INT4 with a calibrated per-tensor mixed-precision policy; `.qt` mmap format |
@@ -77,12 +77,8 @@ Any OpenAI client works with `base_url="http://127.0.0.1:8000/v1"`.
 
 ## Tests
 
-The suites need more than the Quick start: the Qwen2.5-0.5B and Qwen3.5-0.8B checkpoints, the 2B INT8 file, the
-native runtime and the HF golden references (gitignored; generating them needs `transformers`). Once:
-
-```bash
-scripts/.venv/bin/hf download Qwen/Qwen2.5-0.5B-Instruct --local-dir models/qwen2.5-0.5b
-```
+The suites need more than the Quick start: the Qwen3.5-0.8B checkpoint, the 2B INT8 file, the native runtime and
+the HF golden references (gitignored; generating them needs `transformers`). Once:
 
 ```bash
 scripts/.venv/bin/hf download Qwen/Qwen3.5-0.8B --local-dir models/qwen3.5-0.8b
@@ -93,7 +89,7 @@ scripts/.venv/bin/python scripts/quantize.py models/qwen3.5-2b/model.safetensors
 ```
 
 ```bash
-scripts/build_native.sh && scripts/.venv/bin/python scripts/golden_layers.py && scripts/.venv/bin/python scripts/golden_qwen35.py && scripts/.venv/bin/python scripts/golden_qwen35.py models/qwen3.5-2b tests/golden_qwen35_2b bf16
+scripts/build_native.sh && scripts/.venv/bin/python scripts/golden_qwen35.py && scripts/.venv/bin/python scripts/golden_qwen35.py models/qwen3.5-2b tests/golden_qwen35_2b bf16
 ```
 
 Then:
@@ -102,11 +98,15 @@ Then:
 scripts/.venv/bin/python scripts/run_tests.py
 ```
 
-`--quick` skips the quantization, Qwen3.5, serving and prefill suites. The 14 suites cover tokenizer, ops, blocks,
-full models, sampling (incl. batched == per-request), caches, kernels, native runtime, quantization, Qwen3.5-0.8B,
+`--quick` skips the cache, quantization, Qwen3.5, serving and prefill suites (it runs tokenizer, sampling, paged,
+kernels and native). The 11 suites cover the tokenizer, sampling (incl. batched == per-request), the hybrid cache
+(cached == uncached, KV and DeltaNet byte accounting, MPS fp32/bf16 and Metal), paged state (isolation, running out
+of blocks or state slots), kernels, native runtime, quantization, Qwen3.5-0.8B vs HF fp32 (every layer),
 Qwen3.5-2B (bf16/INT8/INT4), the server (batched == sequential, preemption, streaming, 429, cancellation, drain)
-and packed/chunked prefill (packed == alone, chunked == sequential, batching window). The last full run's output
-is in [`docs/bench/raw/tests/`](docs/bench/raw/tests/).
+and packed/chunked prefill (packed == alone, chunked == sequential, batching window). `--save docs/bench/raw/tests`
+archives each suite's output and a summary with timings: the last full run (223 checks, 440 s) is in
+[`docs/bench/raw/tests/`](docs/bench/raw/tests/); the last run with Qwen2.5 is in
+[`docs/bench/raw/tests/2026-09-30-with-qwen2.5/`](docs/bench/raw/tests/2026-09-30-with-qwen2.5/).
 
 ## Benchmarks
 
@@ -119,13 +119,14 @@ a running server at several concurrency levels. Results and methodology are in [
 |---|---|
 | Mac, native (GPU) | `scripts/serve.py` as a launchd service (definition in `docs/design.md`) behind a reverse proxy or tunnel; Metal INT4 |
 | cloud Apple silicon | AWS EC2 Mac or Scaleway Apple silicon, same setup |
-| Linux / any Docker host | `docker build -t inference-engine .` then `docker run --stop-timeout 30 -p 8000:8000 -v "$PWD/models:/app/models:ro" inference-engine` (CPU backend; serves Qwen2.5-0.5B by default) |
+| Linux / any Docker host | `docker build -t inference-engine .` then `docker run --stop-timeout 30 -p 8000:8000 -v "$PWD/models:/app/models:ro" inference-engine` (CPU backend; serves Qwen3.5-0.8B by default; give the VM ≥ 6 GB) |
 
 Docker on macOS cannot reach the Apple GPU (containers run in a Linux VM), so the Metal deployment is a native
-process. The image (1.37 GB, CPU fp32) was built and smoke-tested here: Qwen2.5-0.5B is ready in ~12 s, uses
-2.4 GB, decodes ~4 tok/s, passes the healthcheck, and `docker stop` drains an in-flight stream before exiting.
-Qwen3.5-0.8B in fp32 pages in that 4 GB VM (6 tokens in 114 s); give the VM more memory (6 GB or more suggested,
-not tested). See [`docs/design.md`](docs/design.md#9-deployment).
+process. The image (1.37 GB, CPU fp32) was built and smoke-tested here with the previous default, Qwen2.5-0.5B
+(since removed): it was ready in ~12 s, used 2.4 GB, decoded ~4 tok/s, passed the healthcheck, and `docker stop`
+drained an in-flight stream before exiting. The default is now Qwen3.5-0.8B in fp32 (~3.5 GB peak), which pages
+in Docker Desktop's standard 4 GB VM (3.54 of 3.83 GiB used, 6 tokens in 114 s): give the VM at least 6 GB (not yet
+measured). See [`docs/design.md`](docs/design.md#9-deployment).
 
 ## Layout
 
@@ -133,7 +134,7 @@ not tested). See [`docs/design.md`](docs/design.md#9-deployment).
 src/weight_loader.py   safetensors mmap loader          src/state.py        KV caches, block allocator, HybridState
 src/tokenizer.py       byte-level BPE                   src/quant.py        INT8/INT4, policy, .qt files
 src/chat.py            ChatML templates                 src/sampler.py      temperature/top-k/top-p/repetition
-src/models/            Qwen2.5, Qwen3.5 (hybrid)        src/engine.py       model registry, load_engine
+src/models/            Qwen3.5 (hybrid), packed prefill src/engine.py       model registry, load_engine
 src/backend/           protocol, torch reference, Metal src/kernels/        *.metal kernels
 src/native/            Objective-C++ Metal runtime      src/server/         scheduler, API, metrics
 scripts/               goldens, bench, quantize, calibrate, serve, loadgen, repl, run_tests
