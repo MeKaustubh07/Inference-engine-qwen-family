@@ -194,7 +194,7 @@ after_run2:
 | 8 | 62.4 | 1192 ms | 1232 ms | 113.7 ms | 8.39 s | 8.40 s | 0 |
 ```
 Run 1 was no better than that session's baseline (`loadgen_2b_int4_2026-09-29_before_run1.md`, 77.0 tok/s at 8
-clients); run 2 was slow even at 1 client (24.2 tok/s): something outside the server slowed the machine (not identified). The server log of run 1
+clients); run 2, on the same server process as run 1, was slow even at 1 client (24.2 tok/s); the cause was not identified. The server log of run 1
 (per-request TTFT and latency; no arrival timestamps) shows each 8-client wave's first request prefilled alone
 (~20 tokens) and the other 7, arriving within ~3–11 ms (gaps up to ~6 ms, inferred from their TTFTs), packed
 into a ~155-token pass: the idle engine started on the first arrival. The request prefilled alone then finished a

@@ -80,12 +80,14 @@ with timers, `decode_batch` followed by a GPU synchronize to split issue time fr
 emitting tokens, 1.7 ms the rest. **The "~28 ms" did not reproduce.** In the 2026-09-28 run each 8-client wave
 arrived and finished together, so the last-admitted request decoded its 63 tokens with no prefill in between, at
 108–110 ms per token: that was the run's steady state. Re-measuring the same code, the same request decoded at
-77–90 ms per token in 9 runs (`raw/profiling.md` §10). That run was slower in every step, the same unexplained
-slowness behind its 55.9 tok/s (last paragraph of this section). In the re-measured runs the gap to the engine's
-116 tok/s, 104 vs 69 ms per 8 tokens, splits into ~20 ms of prefill done one prompt at a time (~0.35 s each under
-load, 5.6 s over the run) while the wave's admitted requests waited, and ~15 ms of per-step work around
-`decode_batch`: 8.8 ms of sampling (not the ~12 estimated), ~4 ms of slower issue and GPU time under load, ~2 ms
-emit and the rest.
+77–90 ms per token in 9 runs (`raw/profiling.md` §10). That run was slower at 4 and 8 clients (at 1–2 clients it
+matches the re-measured runs), the same unexplained slowness behind its 55.9 tok/s (last paragraph of this
+section). In the final A/B's before-runs (77.0 tok/s, i.e. 104 ms per 8 tokens against the engine's 69) the gap
+is **about three quarters prefill**: each wave's 8 prompts were prefilled one at a time in ~1.7 s (~0.21 s each,
+~27 ms per 8 tokens) while the admitted requests waited. The other quarter is per-step work around `decode_batch`:
+the last-admitted request decoded at ~78 ms per token, ~9 ms above the engine step, most of it sampling (8.8 ms
+per step in the profiled run, not the ~12 estimated). The instrumented profiling run, with its slower 84 ms
+steps, puts about two thirds of its gap in prefill.
 
 **Prefill cost grows slowly with prompt length once the prompt is past 32 tokens** (`raw/profiling.md` §8): one
 forward of 23 tokens takes 222 ms, of 184 tokens 542 ms. Up to 32 rows the quantized linears run as batched

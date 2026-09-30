@@ -242,10 +242,11 @@ The engine is **stateful**: a sequence's KV blocks and DeltaNet state live in on
 ## 11. Limitations and next steps
 
 - **The server still trails the engine step** (94 vs 116 tok/s at 8 clients; `docs/bench/serving.md`). It was
-  77 (re-measured; the published 56 and its "~28 ms per step of unprofiled work" came from a run that was slower in
-  every step, for reasons not established). Profiling split the 77-vs-116 gap into ~57% prompts prefilled one at a
-  time while every running request waited and ~43% per-step work around the decode step, 8.8 ms of it per-request
-  CPU sampling. Packed + chunked prefill, a 5 ms batching window and batched sampling closed almost half of the gap
+  77 (re-measured; the published 56 and its "~28 ms per step of unprofiled work" came from a run that was slower
+  at 4 and 8 clients, for reasons not established). Measured, about three quarters of the 77-vs-116 gap was prompts
+  prefilled one at a time while the admitted requests waited, and a quarter per-step work around the decode step,
+  mostly per-request CPU sampling (8.8 ms per step in the profiled run). Packed + chunked prefill, a 5 ms batching
+  window and batched sampling closed almost half of the gap
   (77 → 94 of the engine's 116 tok/s). What remains is mostly the packed prefill pass (0.82 s for 8 short prompts,
   ~15% of the time at 8 clients; sampling is ~4%). About a third of that pass (~0.28 s) is attention and the
   DeltaNet recurrence running once per packed sequence: a variable-length prefill kernel is the next step

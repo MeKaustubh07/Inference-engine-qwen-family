@@ -123,10 +123,13 @@ batch-8 decode step, mean             79.4 ms   84.1 ms
   sample (CPU, per request)             6.9       8.8
   emit (detokenize + hand-off)          0.2       0.2
   rest (logits .cpu(), bookkeeping)     1.2       1.7
-admit/prefill over the run            5.7 s     5.6 s   (16 prompts of 19-24 tokens, one at a time)
+admit/prefill over the run            5.7 s     5.6 s   (19-24-token prompts, one at a time; in-process: 16, the
+                                                         first wave cold; HTTP: 24, incl. loadgen's 8 warm-up)
 ```
-There is no unexplained per-step overhead: the gap to the engine-only numbers was prefill, done one prompt at a
-time inside the loop (~0.35 s each under load) while every running request waited.
+There is no unexplained per-step overhead: most of the gap to the engine-only numbers was prefill, done one prompt
+at a time inside the loop (~0.22 s each in the measured waves; the totals above also cover a cold first wave or
+loadgen's warm-up prompts) while every running request waited; the rest is per-step work, mostly sampling (see
+section 10).
 
 ## 8. Prefill time vs prompt length, one forward (same commit)
 
@@ -203,7 +206,17 @@ same code, re-measured 2026-09-29/30 (kept runs):
   (excluded runs: 119.2 / 144.5 and 238.4 / 175.5)
 final code, final A/B runs 2, 3, 5, 8                            72.5 / 72.7,  72.9 / 72.6,  72.2 / 72.2,  71.9 / 72.5
 ```
-So the ~28 ms per step blamed on "unprofiled engine-loop work" belonged to that run, which was slower in every
-step (cause not established; its throughput, 55.9 tok/s at 8 clients, is the same outlier). In the re-measured
-runs the gap to the engine's 116 tok/s (104 vs 69 ms per 8 tokens) is ~20 ms of one-at-a-time prefill and ~15 ms
-of per-step work around decode_batch (section 7).
+So the ~28 ms per step blamed on "unprofiled engine-loop work" belonged to that run, which was slower at 4 and 8
+clients (normal at 1-2; cause not established; its 55.9 tok/s at 8 clients is the same outlier).
+
+Where the gap to the engine's 116 tok/s goes in the final A/B's before-runs (77.0 tok/s = 104 ms per 8 tokens;
+8 waves from the 4 runs' logs):
+```
+prefill, one prompt at a time: 8 prompts in 1.667-1.724 s per wave (0.209-0.215 s each)   ~26.7 ms per 8 tokens
+per-step work: last-admitted request at 77.0-80.2 ms per token vs the 69.0 ms engine step   ~9.1 ms per 8 tokens
+                                                                                  total  ~35.8 ms (104 - 69 = 35)
+```
+About three quarters prefill, a quarter per-step work (mostly sampling: 8.8 ms per step in section 7's profiled
+run). That instrumented run, with its slower 84 ms steps, puts about two thirds of its gap in prefill: its measured
+8-client level (72.2 tok/s, TTFT p50 1,085 ms) had ~3.5 s of prefill vs (84.1 - 69) x 126 = 1.9 s of per-step
+excess; its 5.6 s prefill total also covers loadgen's 8 warm-up prompts.
