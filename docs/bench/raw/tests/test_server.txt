@@ -33,8 +33,11 @@ PASS  rejections are counted in metrics
 PASS  cancelling a queued request frees its queue slot at once (no 429 for the next client)
 PASS  KV pool exhaustion preempts (1 preemptions) and recomputes: outputs still == sequential greedy
 PASS  all KV blocks free after preempted requests finish
-PASS  real uvicorn: SSE chunks arrive as they are generated (first 0.16s, last 1.19s)
-PASS  real uvicorn: a non-streaming request whose client gave up is cancelled (45 of 400 tokens made), blocks freed
+PASS  real uvicorn: SSE chunks arrive as they are generated (first 0.20s, last 1.28s)
+PASS  real uvicorn: a non-streaming request whose client gave up is cancelled (44 of 400 tokens made), blocks freed
+PASS  its request_finished log line says finish_reason 'cancelled' (the engine stops it one step after the handler logs)
+PASS  a stop-string completion is logged with finish_reason 'stop', what the client got ('stop')
+PASS  /metrics shows a request queued behind a step still in progress (waiting 1, running 1)
 PASS  real uvicorn: shutdown runs the lifespan (engine thread stopped, not ready)
 PASS  batched bf16 matvec (M=2,3,8,13,32; with/without bias and residual) == per-row kernel == dense (worst 5.7e-06)
 PASS  batched int8 matvec (M=2,3,8,13,32; with/without bias and residual) == per-row kernel == dense (worst 9.1e-06)
@@ -44,4 +47,4 @@ PASS  qwen3.5-0.8b metal-int4: decode_batch (B up to 4, one joins late) greedy =
 PASS  scheduler over a HybridPool on Metal INT4: 1 preemptions, outputs == decoding alone, all KV blocks and state slots returned
 PASS  qwen2.5-0.5b metal: decode_batch (B up to 4, one joins late) greedy == single-sequence greedy, max|dlogit| 0.0e+00 < 1e-2
 
-45/45 passed
+48/48 passed

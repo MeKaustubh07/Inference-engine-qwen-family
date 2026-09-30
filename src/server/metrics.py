@@ -47,7 +47,7 @@ class Metrics:
                          "decode_steps_total": 0, "decode_sequences_total": 0,   # ratio = mean decode batch size
                          "prefill_steps_total": 0, "prefill_tokens_total": 0}    # ratio = mean packed prefill size
         self.gauges = {"running_requests": 0, "prefilling_requests": 0, "waiting_requests": 0, "kv_blocks_free": 0,
-                       "kv_blocks_total": 0}
+                       "kv_blocks_total": 0, "weights_locked_bytes": 0}
         self.ttft = Histogram("engine_time_to_first_token_seconds", "Time from arrival to the first generated token",
                               self.lock)
         self.tpot = Histogram("engine_time_per_output_token_seconds", "Time between consecutive generated tokens",

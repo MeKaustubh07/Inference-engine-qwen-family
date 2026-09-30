@@ -3,9 +3,12 @@
 usage: serve.py [--model qwen3.5-2b] [--backend metal-int4] [--weights models/qwen3.5-2b/model.int4.qt]
                 [--host 127.0.0.1] [--port 8000] [--max-batch 8] [--max-waiting 64] [--kv-blocks 1024]
                 [--max-model-len 4096] [--drain-timeout 25] [--prefill-chunk 512] [--batch-wait-ms 5]
+                [--no-lock-weights]
 
 With a quantized backend and no --weights, models/<model>/model.<int8|int4>.qt is used when it exists (quantizing
-at load time would briefly need the fp32 weights in RAM). The model is warmed up before the port opens.
+at load time would briefly need the fp32 weights in RAM). The model is warmed up before the port opens, then its
+weights are locked in RAM (Metal backends), so that an idle server's weights are not compressed or swapped out;
+--no-lock-weights turns that off.
 On SIGTERM: stop accepting, let open requests finish for up to --drain-timeout seconds, then exit. Give the
 supervisor a longer stop timeout than that (e.g. docker run --stop-timeout 30).
 """
@@ -37,6 +40,8 @@ def main() -> None:
                     help="prompt tokens per packed prefill pass; longer prompts are split across engine steps")
     ap.add_argument("--batch-wait-ms", type=float, default=5.0,
                     help="an idle engine collects arrivals this close together into one prefill pass (0 = off)")
+    ap.add_argument("--no-lock-weights", action="store_true",
+                    help="do not mlock the weights (Metal): an idle server's first request then pays to page them in")
     a = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
@@ -59,7 +64,7 @@ def main() -> None:
     logging.info(f"loading {a.model} on {a.backend} ({a.weights or 'safetensors'})")
     eng = load_engine(a.model, a.backend, a.weights)
     app = create_app(eng, a.max_batch, a.max_waiting, a.kv_blocks, a.max_model_len, prefill_chunk=a.prefill_chunk,
-                     batch_wait_ms=a.batch_wait_ms)                                    # warms up before returning
+                     batch_wait_ms=a.batch_wait_ms, lock_weights=not a.no_lock_weights)  # warms up before returning
     uvicorn.run(app, host=a.host, port=a.port, log_level="info", timeout_graceful_shutdown=a.drain_timeout)
 
 

@@ -111,5 +111,48 @@ for i in range(5):
 check(f"Metal model: at most 1 near-tie top-1 flip per prompt vs HF fp32 (flips per prompt: {flips})", max(flips) <= 1)
 check(f"Metal model: greedy decode matches HF fp32 for {match}/50 tokens (bf16 may diverge late)", match >= 35)
 
+# weights locked in RAM (backend/pinning.py): mlock of the MTLBuffer pages behind MPS tensors. The kernel's user wire
+# count on the buffers' memory must go to 1 and back to 0 after unlock, and the GPU must still read the same data.
+# (The system-wide wired-page count is no test: the GPU driver itself wires buffers it has just used, and lets go of
+# idle ones, which is when the user wire matters.)
+import ctypes
+from backend.pinning import _ranges, lock_in_memory, unlock
+class SubmapInfo64(ctypes.Structure):                    # <mach/vm_region.h> vm_region_submap_info_64, pack(4)
+    _pack_ = 4
+    _fields_ = [(n, t) for n, t in [
+        ("protection", ctypes.c_int), ("max_protection", ctypes.c_int), ("inheritance", ctypes.c_uint),
+        ("offset", ctypes.c_uint64), ("user_tag", ctypes.c_uint), ("pages_resident", ctypes.c_uint),
+        ("pages_shared_now_private", ctypes.c_uint), ("pages_swapped_out", ctypes.c_uint), ("pages_dirtied", ctypes.c_uint),
+        ("ref_count", ctypes.c_uint), ("shadow_depth", ctypes.c_ushort), ("external_pager", ctypes.c_ubyte),
+        ("share_mode", ctypes.c_ubyte), ("is_submap", ctypes.c_int), ("behavior", ctypes.c_int),
+        ("object_id", ctypes.c_uint32), ("user_wired_count", ctypes.c_ushort), ("pages_reusable", ctypes.c_uint)]]
+libc = ctypes.CDLL(None)
+def user_wired(addr: int) -> int:
+    """user_wired_count of the VM map entry holding addr (descending into submaps)."""
+    a, size, depth, info = ctypes.c_uint64(addr), ctypes.c_uint64(0), ctypes.c_uint(0), SubmapInfo64()
+    while True:
+        cnt = ctypes.c_uint(ctypes.sizeof(SubmapInfo64) // 4)
+        kr = libc.mach_vm_region_recurse(ctypes.c_uint.in_dll(libc, "mach_task_self_"), ctypes.byref(a),
+                                         ctypes.byref(size), ctypes.byref(depth), ctypes.byref(info), ctypes.byref(cnt))
+        if kr != 0 or not info.is_submap:
+            return -1 if kr != 0 else info.user_wired_count
+        depth.value += 1
+ws = [torch.randn(4096, 4096, device=dev) for _ in range(4)]            # 4 x 64 MiB
+xv = torch.randn(4096, device=dev)
+ref = [w @ xv for w in ws]
+torch.mps.synchronize()
+need = sum(w.untyped_storage().nbytes() for w in ws)
+addrs = [p for p, _ in _ranges(ws)]
+before = [user_wired(p) for p in addrs]
+locked = lock_in_memory(ws + [ws[0][:10]])                               # a view: its buffer counted once
+during = [user_wired(p) for p in addrs]
+same = all(maxdiff(w @ xv, r) == 0 for w, r in zip(ws, ref))
+unlock(ws)
+after = [user_wired(p) for p in addrs]
+check(f"lock_in_memory: {locked / 2**20:.0f} MiB locked for 4 x 64 MiB MPS tensors (+ a view of one); user wire "
+      f"count of their memory {before} -> {during} -> {after} after unlock; GPU results unchanged",
+      need <= locked < need + 4 * 2**20 and before == [0] * 4 and during == [1] * 4 and after == [0] * 4 and same)
+del ws, ref
+
 print(f"\n{sum(results)}/{len(results)} kernel checks passed")
 sys.exit(0 if all(results) else 1)

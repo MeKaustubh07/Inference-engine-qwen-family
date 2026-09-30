@@ -187,8 +187,9 @@ the same route above 32 rows, so a prompt packed with others keeps fp32 activati
 | overload | bounded queue → 429 + Retry-After; admission by KV blocks; preemption instead of OOM |
 | slow or gone clients | a disconnect (streaming, or non-streaming, polled every second) cancels the request at the next step and frees its blocks |
 | shutdown | SIGTERM → uvicorn stops accepting and lets open requests finish (up to `--drain-timeout`, 25 s) → the lifespan stops the scheduler (anything left has no client, 2 s) → exit; run containers with a longer stop timeout (`docker run --stop-timeout 30`) |
-| metrics | Prometheus: request/token counters, prefill passes and tokens, running/prefilling/waiting/KV-free gauges, TTFT/TPOT/e2e histograms |
-| logs | one JSON line per finished request (id, tokens, finish reason, TTFT, latency) |
+| metrics | Prometheus: request/token counters, prefill passes and tokens, running/prefilling/waiting/KV-free gauges (read at scrape time, so a request queued behind a step in progress shows), weights locked in RAM, TTFT/TPOT/e2e histograms |
+| logs | one JSON line per finished request (id, tokens, finish reason as the client was told it, `cancelled` for a client that left, TTFT, latency) |
+| memory residency | after the warm-up the weights are `mlock`ed, so an idle server's next request does not wait for macOS to page them back in (measured 0.25 s warm vs up to 0.81 s after 4 min idle; `--no-lock-weights` turns it off) |
 | failure isolation | a failed packed prefill pass fails the requests in that pass; a request that cannot be sampled fails alone; a failed decode step fails every request in flight (running and still prefilling), not the server |
 
 ## 9. Deployment
@@ -221,7 +222,9 @@ a minimal definition, saved as `~/Library/LaunchAgents/com.example.inference-eng
 
 launchd restarts the process if it dies (`KeepAlive`) and sends SIGTERM with a 30 s grace period on stop
 (`ExitTimeOut`), which covers the server's 25 s drain. A reverse proxy or tunnel in front terminates TLS and
-routes to `127.0.0.1:8000`; its health check should use `/ready`.
+routes to `127.0.0.1:8000`; its health check should use `/ready`. Give the server memory of its own: on unified
+memory, a browser, an editor or Docker Desktop's VM on the same 8 GB push an idle server's pages out (the weights are
+locked, the KV cache and DeltaNet state pools are not; `docs/bench/serving.md`).
 
 ## 10. Scaling beyond one machine (design, not built)
 
@@ -251,6 +254,9 @@ The engine is **stateful**: a sequence's KV blocks and DeltaNet state live in on
   ~15% of the time at 8 clients; sampling is ~4%). About a third of that pass (~0.28 s) is attention and the
   DeltaNet recurrence running once per packed sequence: a variable-length prefill kernel is the next step
   (prefill/decode disaggregation is the multi-machine version).
+- **After idle and on first use**: the KV cache and DeltaNet state pools (~0.5 GB) are not locked, so an idle server
+  can still lose up to ~0.2 s on its next first token, and the first request of each new prompt length pays
+  ~0.1–0.2 s of MPS shape compilation. Locking the pools and warming common prompt lengths at start-up fix both.
 - Batch 2 barely beats batch 1: the linears cost 33 vs 17 ms, and the 2-rows kernel is 1.2–2.1× slower than the
   single-row kernel at one row (which is why M = 1 keeps its own kernel).
   Simdgroup-matrix (8×8 hardware tile) kernels, as in MLX and llama.cpp's `mul_mm`, are the next step for both

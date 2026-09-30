@@ -115,6 +115,22 @@ Details: `docs/bench/decode.md`, `docs/bench/quant.md`.
 | what is left of the gap to 116 | lockstep waves: 0.82 s packed prefill (which yields the first tokens) + 63 × ~73 ms steps ≈ 5.4 s per 512 tokens ≈ 94 tok/s; prefill ~15%, sampling ~4% |
 | tests | 14 suites pass; `test_sampling` 23 (batched == per-row on CPU and MPS over 300 random batches), `test_prefill` 18, `test_server` 45 |
 
+## Deployment tour (2026-09-30; `docs/bench/serving.md`, raw in `raw/deployment_tour_2026-09-30.md`)
+
+| step | result |
+|---|---|
+| server run by hand: health, ready, metrics, chat, completions, streaming, seeds, validation | all as designed |
+| load test at 8 clients against the deployed server | 94.8 tok/s, TTFT p50 817 ms (A/B: 94.3) |
+| 80 simultaneous requests | 72 accepted (8 in flight + 64 queued), 8 × 429 with Retry-After: 1; all 80 clients dropped → cleaned up within ~1 s |
+| SIGTERM mid-stream | 150-token stream finished with [DONE], new connections refused, exit 2.9 s after the signal |
+| **found: idle server loses its weights** | first token 0.24 s back to back vs 0.69–0.81 s after 1–4 min idle; 1.4–2.2 GB paged back in (28 MB when warm). Weights are Metal buffers in unified memory, compressed by macOS while idle |
+| fix tried: Metal residency set + requestResidency | no effect (in-process prefill after 60 / 180 s idle: 494 / 617 ms) |
+| **fix: mlock the weight buffers** (`src/backend/pinning.py`) | in-process prefill after 60 s idle 438 / 396 → 229 / 235 ms, after 3 min 530 / 433 → 264 / 278 ms (warm 186–190); through the server, after 4 min idle 0.512 / 0.668 → 0.323 / 0.447 s (warm 0.25). KV/state pools (~0.5 GB) not locked yet |
+| found: queue gauges refreshed once per engine step | peak `waiting` 0 during the load test → read at scrape time |
+| found: request log `finish_reason: null` for cancelled running requests | 17 of 73 in the burst → reason as sent to the client; review caught stop-string completions logged `cancelled`, fixed |
+| also seen | first request of a new prompt length +0.1–0.2 s (MPS shape compilation), not fixed |
+| tests | `test_kernels` 26, `test_server` 48, `test_prefill` 18; with the server fixes reverted, the 2 new server checks fail |
+
 ## Container (Docker Engine 29.5.3 in Docker Desktop, 3.83 GiB VM, 8 vCPU, arm64; transcript in `raw/early_measurements.md`)
 
 | check | result |
@@ -154,3 +170,4 @@ Load-test and benchmark tables: `docs/bench/serving.md`, `docs/bench/qwen35.md`,
 | server gap documentation numbers | 68 | 32 → 27 confirmed, 3 split, all fixed | 63 not 64 decode steps per wave; prefill cost explanation; "closed most of the gap" → almost half |
 | server gap documentation numbers, round 2 | 26 | 30 earlier fixes all hold; 11 new → 8 confirmed, 1 split, all fixed | the "~28 ms" was the 2026-09-28 run's slower steps, not prefill stalls; a breakdown that did not add up |
 | server gap documentation numbers, rounds 3–4 | 52 | 20 → 16 confirmed, then 4 → 3 confirmed; all fixed (after `0ee0f08`) | the gap split mixed two runs (now ~3/4 prefill within one run); the 2026-09-28 run was slow only at 4–8 clients; a prefill total included loadgen's warm-up prompts |
+| deployment fixes (lock, gauges, log reasons) | 31 | 14 → 2 confirmed (the same defect), fixed | the log fix wrote `cancelled` for stop-string completions |

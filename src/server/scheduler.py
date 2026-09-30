@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 
 import torch
 
+from backend.pinning import lock_in_memory, model_tensors
 from sampler import SamplingParams, sample, sample_batch
 from state import OutOfBlocks
 
@@ -55,7 +56,7 @@ class Request:
 class Scheduler:
     def __init__(self, engine, metrics, max_batch: int = 8, max_waiting: int = 64, kv_blocks: int = 1024,
                  block_size: int = 16, max_model_len: int = 4096, prefill_chunk: int = 512,
-                 batch_wait_ms: float = 5.0):
+                 batch_wait_ms: float = 5.0, lock_weights: bool = False):
         if not 1 <= max_batch <= 32:                          # batched decode kernels cover up to 32 rows
             raise ValueError("max_batch must be between 1 and 32")
         self.eng, self.metrics = engine, metrics
@@ -78,7 +79,16 @@ class Scheduler:
         self._stop = False
         self._ids = itertools.count()
         self._arrivals = 0                                    # submitted so far: the batching window counts these
-        self._warmup()
+        self._warmup()                                        # every layer has run: the weight cache is complete
+        # keep the weights in RAM (MPS only): otherwise an idle server's weights get compressed or swapped and the
+        # next request waits for them to come back (backend/pinning.py)
+        self.weights_locked, self.lock_error = 0, None
+        if lock_weights:
+            try:
+                self.weights_locked = lock_in_memory(model_tensors(self.model))
+            except (OSError, ValueError) as e:                # serve anyway, without the guarantee
+                self.lock_error = str(e)
+        metrics.set("weights_locked_bytes", self.weights_locked)
         metrics.set("kv_blocks_total", kv_blocks)
         metrics.set("kv_blocks_free", self.pool.allocator.num_free)
         self.thread = threading.Thread(target=self._loop, name="engine", daemon=True)
@@ -355,6 +365,13 @@ class Scheduler:
         self.metrics.inc("requests_finished_total")
         if reason in ("stop", "length"):                      # completed requests only; errors/cancels are counted
             self.metrics.e2e.observe(time.perf_counter() - req.arrived)
+
+    def refresh_gauges(self) -> None:
+        """Any thread (/metrics calls it at scrape time). The engine loop refreshes the gauges once per iteration,
+        after admitting; a request that waits for less than one iteration (behind a ~0.8 s prefill pass, say) would
+        otherwise never show up in waiting_requests, the signal an autoscaler watches."""
+        with self.cond:
+            self._update_gauges()
 
     def _update_gauges(self) -> None:
         self.metrics.set("running_requests", len(self.running))

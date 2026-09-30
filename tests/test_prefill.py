@@ -69,9 +69,10 @@ def packed_vs_alone(eng, tol):
           d < tol and max(map(len, long)) <= 32 < sum(map(len, long)))
 
 
-def run_scheduler(eng, prompts, n, chunk, kv_blocks=256, max_batch=4):
+def run_scheduler(eng, prompts, n, chunk, kv_blocks=256, max_batch=4, lock_weights=False):
     """Submit all prompts; return texts, the scheduler's counters and the emit order [(request id, tokens)]."""
-    s = Scheduler(eng, Metrics(), max_batch=max_batch, kv_blocks=kv_blocks, prefill_chunk=chunk)
+    s = Scheduler(eng, Metrics(), max_batch=max_batch, kv_blocks=kv_blocks, prefill_chunk=chunk,
+                  lock_weights=lock_weights)
     order, emit = [], s._emit
     def logged(req, token):
         emit(req, token); order.append((req.id, len(req.generated)))
@@ -196,11 +197,12 @@ for name, backend, tol in [("qwen3.5-0.8b", "metal-int4", 1e-2), ("qwen2.5-0.5b"
         V, eos = eng.tokenizer.vocab_size(), set(eng.eos_ids)
         prompts = [PROMPTS[1], PROMPTS[3], PROMPTS[2]]      # ~4 / ~19 / ~2 tokens + 30 new: 8+ blocks needed, 6 exist
         want = [eng.tokenizer.decode(sequential(eng.model, V, eng.tokenizer.encode(p), 30, eos)) for p in prompts]
-        texts, c, _, sch = run_scheduler(eng, prompts, 30, chunk=4, kv_blocks=6, max_batch=3)
+        texts, c, _, sch = run_scheduler(eng, prompts, 30, chunk=4, kv_blocks=6, max_batch=3, lock_weights=True)
         check(f"{name} {backend}: 4-token prefill chunks + a KV pool small enough to preempt "
-              f"({c['requests_preempted_total']} preemptions) == decoding alone; every block and state slot returned",
+              f"({c['requests_preempted_total']} preemptions) == decoding alone, with the weights locked in RAM "
+              f"({sch.weights_locked / 2**20:.0f} MiB); every block and state slot returned",
               texts == want and c["requests_preempted_total"] >= 1 and sch.pool.allocator.num_free == 6
-              and len(sch.pool.free_seqs) == 3)
+              and len(sch.pool.free_seqs) == 3 and sch.weights_locked > 0 and sch.lock_error is None)
     del eng
     gc.collect(); torch.mps.empty_cache()
 

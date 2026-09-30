@@ -114,10 +114,17 @@ class OutputFilter:
 
 
 def create_app(engine, max_batch: int = 8, max_waiting: int = 64, kv_blocks: int = 1024, max_model_len: int = 4096,
-               drain_timeout: float = 2.0, prefill_chunk: int = 512, batch_wait_ms: float = 5.0) -> FastAPI:
+               drain_timeout: float = 2.0, prefill_chunk: int = 512, batch_wait_ms: float = 5.0,
+               lock_weights: bool = False) -> FastAPI:
     metrics = Metrics()
     sched = Scheduler(engine, metrics, max_batch=max_batch, max_waiting=max_waiting, kv_blocks=kv_blocks,
-                      max_model_len=max_model_len, prefill_chunk=prefill_chunk, batch_wait_ms=batch_wait_ms)
+                      max_model_len=max_model_len, prefill_chunk=prefill_chunk, batch_wait_ms=batch_wait_ms,
+                      lock_weights=lock_weights)
+    if lock_weights:
+        if sched.lock_error:
+            log.warning(f"could not lock the weights in memory ({sched.lock_error}); an idle server may be paged out")
+        else:
+            log.info(f"weights locked in memory: {sched.weights_locked / 2**30:.2f} GiB")
 
     @contextlib.asynccontextmanager
     async def lifespan(_app):
@@ -198,11 +205,13 @@ def create_app(engine, max_batch: int = 8, max_waiting: int = 64, kv_blocks: int
 
         if body.stream:
             async def gen():
+                final = None
                 try:
                     if chat:
                         yield chunk({"role": "assistant", "content": ""})
                     async for kind, text in stream_events:
                         if kind == "finish":
+                            final = text
                             yield chunk(finish=text)
                         elif chat:
                             yield chunk({"reasoning_content" if kind == "reasoning" else "content": text})
@@ -212,7 +221,7 @@ def create_app(engine, max_batch: int = 8, max_waiting: int = 64, kv_blocks: int
                 except RuntimeError as e:
                     yield "data: " + json.dumps({"error": {"message": str(e)}}) + "\n\n"
                 finally:
-                    _log(req, n_prompt)
+                    _log(req, n_prompt, final)
             return StreamingResponse(gen(), media_type="text/event-stream")
 
         async def collect():
@@ -226,7 +235,7 @@ def create_app(engine, max_batch: int = 8, max_waiting: int = 64, kv_blocks: int
             except RuntimeError as e:
                 raise HTTPException(500, str(e))
             finally:
-                _log(req, n_prompt)
+                _log(req, n_prompt, reason)
             if reason is None:                                # client left: nobody to answer
                 raise HTTPException(499, "client closed request")
             text = "".join(parts)
@@ -243,10 +252,14 @@ def create_app(engine, max_batch: int = 8, max_waiting: int = 64, kv_blocks: int
                                            "total_tokens": n_prompt + len(req.generated)}})
         return collect()
 
-    def _log(req, n_prompt: int) -> None:
+    def _log(req, n_prompt: int, told: str | None = None) -> None:
+        """told: the finish_reason the client was sent, if any. It comes first: a stop string ends the request
+        through cancel(), but it finished normally. A request cancelled while running (client gone) is stopped by
+        the engine at its next step, after this line runs, so its own finish_reason may still be unset."""
         ttft = (req.first_token_at - req.arrived) if req.first_token_at else None
+        reason = told or req.finish_reason or ("cancelled" if req.cancelled else None)
         log.info(json.dumps({"event": "request_finished", "id": req.id, "prompt_tokens": n_prompt,
-                             "completion_tokens": len(req.generated), "finish_reason": req.finish_reason,
+                             "completion_tokens": len(req.generated), "finish_reason": reason,
                              "ttft_s": round(ttft, 4) if ttft else None,
                              "latency_s": round(time.perf_counter() - req.arrived, 4)}))
 
@@ -283,6 +296,7 @@ def create_app(engine, max_batch: int = 8, max_waiting: int = 64, kv_blocks: int
 
     @app.get("/metrics")
     def prometheus():
+        sched.refresh_gauges()                            # queue gauges as of now, not as of the last engine step
         return PlainTextResponse(metrics.render(), media_type="text/plain; version=0.0.4")
 
     return app

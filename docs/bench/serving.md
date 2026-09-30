@@ -163,7 +163,54 @@ TTFT p50 (TPOT p50 at 2 clients: 45.4 vs 44.0 ms); at 4–8 clients it was slowe
 Its cause was not established, but it has the shape of the excluded runs (normal early in the run, slow later);
 the comparison above uses only runs taken side by side.
 
-## Operational behaviour verified (tests/test_server.py, 45 checks; output in `raw/tests/test_server.txt`)
+## Running it by hand: what testing the deployed server found (2026-09-30)
+
+The server was started natively and exercised the way an operator would (raw: `raw/deployment_tour_2026-09-30.md`):
+`/health`, `/ready`, `/metrics`, chat and text completions, streaming, seeded and greedy determinism, input
+validation (422 / 400), a load test at 1 and 8 clients (94.8 tok/s at 8, as in the A/B above), backpressure (80
+simultaneous requests: 72 accepted, i.e. 8 in flight plus a full 64-slot queue, and 8 rejected with 429 and
+`Retry-After: 1`), client disconnects (all 80 clients dropped: everything cleaned up within ~1 s; one stream closed
+after 20 tokens: stopped 0.12 s later) and SIGTERM mid-stream (the 150-token stream finished with `[DONE]`, new
+connections were refused, the process exited 2.9 s after the signal). Three problems showed up that no benchmark or
+test had caught:
+
+1. **An idle server loses its weights to the OS.** The same 19-token request got its first token in 0.24 s back to
+   back, but 0.69–0.81 s after 1–4 minutes of idle. On unified memory the 2.1 GB of Metal buffers holding the
+   weights are ordinary RAM, and macOS compressed or swapped them while the server idled: 1.4–2.2 GB came back in
+   during the slow requests, 28 MB during the fast one. The load tests never saw it because their requests come
+   back to back. Fix: after its warm-up the scheduler `mlock`s the pages of every weight buffer
+   (`src/backend/pinning.py`; `--no-lock-weights` turns it off; `engine_weights_locked_bytes` in `/metrics`). MPS
+   tensors live in shared-storage `MTLBuffer`s, so each has a CPU address, and wired pages can be neither compressed
+   nor swapped; the test reads the kernel's wire count on that memory (0 → 1 → 0 after unlock). A Metal residency set
+   with `requestResidency`, MLX's approach, was tried first and did not stop the reclaim here.
+
+   | after idle | weights not locked | `mlock` | residency set |
+   |---|---:|---:|---:|
+   | in-process prefill, 60 s | 438 / 396 ms | 229 / 235 ms | 494 ms |
+   | in-process prefill, 3 min | 530 / 433 ms | 264 / 278 ms | 617 ms |
+   | server first token, 60 s | 0.330 / 0.450 s | 0.343 / 0.310 s | — |
+   | server first token, 4 min | 0.512 / 0.668 s | 0.323 / 0.447 s | — |
+
+   Warm: prefill 186–190 ms in-process, first token 0.25–0.26 s through the server. The in-process runs saw more
+   memory pressure (21–32% free) than the server runs (31–40%). The lock covers the 1.32 GiB of weights, not the KV
+   cache and DeltaNet state pools (~0.5 GB) or the rest of the process: in the slowest locked run 808 MB still came
+   back. Locking the pools too is the next step; the operational answer is to give a model server memory of its own
+   (a dedicated host, or memory requests and limits under Kubernetes).
+2. **The queue gauges missed short waits.** `waiting` and `prefilling` were refreshed once per engine iteration,
+   after admission, so a request that waited up to ~0.8 s behind a prefill pass never showed (peak `waiting` 0
+   during the load test). `/metrics` now reads them from the scheduler at scrape time; the test holds the engine
+   mid-step and requires `waiting 1, running 1`.
+3. **Cancelled requests were logged with `finish_reason: null`.** The handler writes the `request_finished` line
+   before the engine thread processes the cancel (17 of 73 lines in the burst). The line now carries the reason the
+   client was told, then the engine's, then `cancelled` for a client that left. The code review caught that the
+   first version of this fix logged stop-string completions, which end through the same cancel, as `cancelled`;
+   fixed, and tested both ways.
+
+Also seen, not fixed: the first request of a given prompt length after start-up costs ~0.1–0.2 s extra (first token
+0.34–0.45 s vs 0.25 s, with little memory brought back), most likely MPS compiling kernels for new tensor shapes;
+warming the common prompt lengths at start-up would remove it.
+
+## Operational behaviour verified (tests/test_server.py, 48 checks; output in `raw/tests/test_server.txt`)
 
 Scope: the HTTP and scheduler checks run on Qwen2.5-0.5B on the CPU (fp32, fast and exact to compare against);
 Qwen3.5 on Metal is covered by batched == single-sequence decode (bf16, INT4) and by a scheduler run over its
@@ -175,6 +222,9 @@ pooled state with forced preemption (INT4). The served 2B model itself was exerc
 | preemption changes nothing | KV pool too small for the load → preempted, recomputed, identical output; every block and state slot returned |
 | backpressure | queue of 1, 6 simultaneous requests → 429 + Retry-After, counted in `/metrics` |
 | streaming | SSE chunks concatenate to the non-stream text; UTF-8 held back until complete (Hindi); first chat delta carries the role |
-| client disconnect | real uvicorn: a non-streaming client that gives up after 1.5 s is cancelled server-side (45 of 400 tokens generated in the archived run of 2026-09-30, 43 and 29 in earlier ones recorded in `raw/early_measurements.md`; the server polls every second) |
+| client disconnect | real uvicorn: a non-streaming client that gives up after 1.5 s is cancelled server-side (44 of 400 tokens generated in the archived run, 45, 43 and 29 in earlier ones recorded in `raw/early_measurements.md`; the server polls every second) |
 | graceful shutdown | scheduler drain: in-flight request finishes, new ones refused, `ready()` false (the flag `/ready` turns into a 503); real uvicorn: the lifespan stops the engine thread; manual `docker stop` mid-stream: the stream completed before exit (`raw/early_measurements.md`) |
 | bad input | 422 for invalid parameters (incl. lone surrogates, which crashed FastAPI's default handler), 400 for prompts that can never fit |
+| queue gauges | the engine held mid-step, a second request submitted: `/metrics` shows `waiting 1, running 1` (read at scrape time) |
+| request log reasons | a client that gives up mid-request is logged `cancelled`; a stop-string completion is logged `stop`, as the client was told |
+| weights locked in RAM | `tests/test_kernels.py`: the kernel's wire count on the MPS buffers' memory goes 0 → 1 → 0 after unlock, GPU results unchanged; `tests/test_prefill.py`: a scheduler with the lock on (0.8B INT4) matches decoding alone |

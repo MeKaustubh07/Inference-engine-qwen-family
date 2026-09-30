@@ -297,9 +297,13 @@ async def preemption_suite():
 
 def uvicorn_suite():
     """The real server over a real socket: incremental SSE, disconnect handling, lifespan shutdown."""
+    import logging
     import socket
     import threading
     import uvicorn
+    logged = []                                                   # the server's JSON request log lines
+    grab = logging.Handler(); grab.emit = lambda rec: logged.append(rec.getMessage())
+    logging.getLogger("engine.server").addHandler(grab); logging.getLogger("engine.server").setLevel(logging.INFO)
     sock = socket.socket(); sock.bind(("127.0.0.1", 0)); port = sock.getsockname()[1]; sock.close()
     app = create_app(eng, max_batch=2, max_waiting=4, kv_blocks=64, max_model_len=512)
     sched = app.state.scheduler
@@ -329,6 +333,38 @@ def uvicorn_suite():
     made = sched.metrics.counters["generation_tokens_total"] - before
     check(f"real uvicorn: a non-streaming request whose client gave up is cancelled ({made} of 400 tokens made), "
           f"blocks freed", not sched.active and made < 400 and sched.pool.allocator.num_free == 64)
+    last = json.loads([m for m in logged if '"request_finished"' in m][-1])
+    check(f"its request_finished log line says finish_reason {last['finish_reason']!r} (the engine stops it one step "
+          f"after the handler logs)", last["finish_reason"] == "cancelled" and last["completion_tokens"] < 400)
+    # a stop string also ends the request through cancel(), but the request finished normally: the log line must say
+    # what the client was told
+    ref = ref_text(PROMPTS[1], 20)
+    r = httpx.post(f"{url}/v1/completions", json={"prompt": PROMPTS[1], "max_tokens": 20, "stop": [ref[5:8]],
+                                                  "temperature": 0, "repetition_penalty": 1.0}, timeout=120)
+    last = json.loads([m for m in logged if '"request_finished"' in m][-1])
+    check(f"a stop-string completion is logged with finish_reason {last['finish_reason']!r}, what the client got "
+          f"({r.json()['choices'][0]['finish_reason']!r})",
+          r.json()["choices"][0]["finish_reason"] == "stop" and last["finish_reason"] == "stop")
+
+    # /metrics reports the queue as it is now, even while the engine is in the middle of a step
+    while sched.active:                                           # the stop-string request above ends one step later
+        time.sleep(0.01)
+    entered, gate, orig = threading.Event(), threading.Event(), sched._decode_step
+    def held():
+        entered.set(); gate.wait(30); orig()
+    sched._decode_step = held
+    first = sched.submit(eng.tokenizer.encode(PROMPTS[0]), GREEDY, 3)
+    entered.wait(30)                                              # first is running; the engine is held mid-step
+    second = sched.submit(eng.tokenizer.encode(PROMPTS[1]), GREEDY, 3)
+    scraped = {l.split()[0]: float(l.split()[1]) for l in httpx.get(f"{url}/metrics").text.splitlines()
+               if l.startswith(("engine_waiting_requests ", "engine_running_requests "))}
+    sched._decode_step = orig; gate.set()
+    for r in (first, second):
+        while r.out.get(timeout=120)[0] == "token":
+            pass
+    check(f"/metrics shows a request queued behind a step still in progress (waiting "
+          f"{scraped['engine_waiting_requests']:.0f}, running {scraped['engine_running_requests']:.0f})",
+          scraped["engine_waiting_requests"] == 1 and scraped["engine_running_requests"] == 1)
     server.should_exit = True
     th.join(30)
     check("real uvicorn: shutdown runs the lifespan (engine thread stopped, not ready)",
