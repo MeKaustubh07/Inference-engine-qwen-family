@@ -22,8 +22,8 @@ HEALTHCHECK --interval=15s --timeout=3s --start-period=120s \
   CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')" || exit 1
 # weights are mounted at /app/models (not baked in: the image stays small and models can change without a rebuild)
 ENTRYPOINT ["python", "scripts/serve.py", "--host", "0.0.0.0", "--port", "8000"]
-# Default: Qwen3.5-0.8B in fp32, ~3.5 GB peak. Docker Desktop's standard 4 GB VM is too small: it pages (3.54 of
-# 3.83 GiB used, 6 tokens took 114 s). Give the VM at least 6 GB (not yet measured with this default). The previous
-# default, Qwen2.5-0.5B (since removed), measured ready in ~12 s, 2.4 GB, ~4 tok/s decode on 8 vCPUs.
-# The GPU path (Metal, INT4 2B) is scripts/serve.py run natively on macOS.
+# Default: Qwen3.5-0.8B in fp32, ~3.5 GB. This image is for Linux hosts and CI with memory to spare. On an 8 GB Mac
+# under Docker Desktop it is impractically slow even with a 5 GB VM (measured 2026-10-01: ready in 51 s, healthcheck
+# healthy, but ~0.1 tok/s; the fp32 weights do not stay resident in the VM; docs/bench/raw/docker_2026-10-01.md).
+# On a Mac, run scripts/serve.py natively: Metal, INT4 2B, ~50 tok/s per stream.
 CMD ["--model", "qwen3.5-0.8b", "--backend", "cpu", "--kv-blocks", "256", "--max-batch", "4"]

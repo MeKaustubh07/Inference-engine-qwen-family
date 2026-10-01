@@ -130,6 +130,8 @@ Details: `docs/bench/decode.md`, `docs/bench/quant.md`.
 | found: queue gauges refreshed once per engine step | peak `waiting` 0 during the load test → read at scrape time |
 | found: request log `finish_reason: null` for cancelled running requests | 17 of 73 in the burst → reason as sent to the client; review caught stop-string completions logged `cancelled`, fixed |
 | also seen | first request of a new prompt length +0.1–0.2 s (MPS shape compilation), not fixed |
+| Stage 7 (2026-10-01): the CPU container, Qwen3.5-0.8B fp32, Docker Desktop VM 4.80 GiB | ready 50.7 s, healthcheck healthy at 52.9 s, 3.49 GiB; first request: first token 10.1 s, 56 tokens in 510 s (**0.11 tok/s**; natively on the Mac's CPU 11.7) (`raw/docker_2026-10-01.md`) |
+| why | not denormals (0 of 5,050,368 state values; flushing them changes nothing), not threads (1 thread: 53 s/token, 8 threads: 18 s/token). At 1 thread a step reads ~3 GB of weights at ~60 MB/s, a storage rate: the weights do not stay resident in the VM. Conclusion: the image is for Linux hosts and CI; on a Mac, run natively |
 | tests | `test_kernels` 26, `test_server` 48, `test_prefill` 18; with the server fixes reverted, the 2 new server checks fail |
 
 ## Container (Docker Engine 29.5.3 in Docker Desktop, 3.83 GiB VM, 8 vCPU, arm64; transcript in `raw/early_measurements.md`)

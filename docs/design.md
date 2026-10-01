@@ -198,7 +198,7 @@ the same route above 32 rows, so a prompt packed with others keeps fp32 activati
 |---|---|---|
 | a Mac (M-series), native | Metal INT4 | `scripts/serve.py` as a launchd service (below); best performance; expose with a reverse proxy or a tunnel (Tailscale / Cloudflare Tunnel) |
 | cloud Apple silicon | Metal INT4 | AWS EC2 Mac (mac2.metal = M1, mac2-m2.metal = M2) or Scaleway Apple silicon; same launchd setup |
-| Linux container | CPU fp32 (TorchBackend) | `Dockerfile` (1.37 GB image); default Qwen3.5-0.8B in fp32 (~3.5 GB peak): it pages in Docker Desktop's 4 GB VM (3.54 of 3.83 GiB, 6 tokens in 114 s), so give the VM ≥ 6 GB (not yet measured); the healthcheck and graceful stop were verified with the previous default, Qwen2.5-0.5B (~4 tok/s, since removed); Docker on a Mac cannot reach the Apple GPU |
+| Linux container | CPU fp32 (TorchBackend) | `Dockerfile` (1.37 GB image), for Linux hosts and CI with memory to spare. Default Qwen3.5-0.8B in fp32 (~3.5 GB): on this 8 GB Mac under Docker Desktop, even with a 5 GB VM, ready in 51 s and healthy but ~0.1 tok/s, because the weights do not stay resident in the VM (`docs/bench/raw/docker_2026-10-01.md`). The graceful stop was verified with the previous default, Qwen2.5-0.5B (~4 tok/s, since removed). Docker on a Mac cannot reach the Apple GPU |
 
 A container cannot use Metal: Docker Desktop on macOS runs Linux in a VM with no Apple GPU. The GPU deployment is
 therefore a native process; its "container" is a pinned venv plus a launchd service (not included in the repo;

@@ -119,14 +119,15 @@ a running server at several concurrency levels. Results and methodology are in [
 |---|---|
 | Mac, native (GPU) | `scripts/serve.py` as a launchd service (definition in `docs/design.md`) behind a reverse proxy or tunnel; Metal INT4 |
 | cloud Apple silicon | AWS EC2 Mac or Scaleway Apple silicon, same setup |
-| Linux / any Docker host | `docker build -t inference-engine .` then `docker run --stop-timeout 30 -p 8000:8000 -v "$PWD/models:/app/models:ro" inference-engine` (CPU backend; serves Qwen3.5-0.8B by default; give the VM ≥ 6 GB) |
+| Linux / any Docker host | `docker build -t inference-engine .` then `docker run --stop-timeout 30 -p 8000:8000 -v "$PWD/models:/app/models:ro" inference-engine` (CPU backend, Qwen3.5-0.8B in fp32 by default; for Linux hosts and CI with RAM to spare, not for a Mac) |
 
-Docker on macOS cannot reach the Apple GPU (containers run in a Linux VM), so the Metal deployment is a native
-process. The image (1.37 GB, CPU fp32) was built and smoke-tested here with the previous default, Qwen2.5-0.5B
-(since removed): it was ready in ~12 s, used 2.4 GB, decoded ~4 tok/s, passed the healthcheck, and `docker stop`
-drained an in-flight stream before exiting. The default is now Qwen3.5-0.8B in fp32 (~3.5 GB peak), which pages
-in Docker Desktop's standard 4 GB VM (3.54 of 3.83 GiB used, 6 tokens in 114 s): give the VM at least 6 GB (not yet
-measured). See [`docs/design.md`](docs/design.md#9-deployment).
+Docker on macOS cannot reach the Apple GPU (containers run in a Linux VM), so on a Mac the deployment is the native
+process. The CPU image (1.37 GB) is for Linux hosts and CI. On this 8 GB Mac under Docker Desktop, even with a 5 GB VM,
+the Qwen3.5-0.8B default was ready in 51 s and passed the healthcheck but decoded at ~0.1 tok/s, because the fp32
+weights do not stay resident in the VM (`docs/bench/raw/docker_2026-10-01.md`; natively, the same model on the CPU
+does 11.7 tok/s). With the previous default, Qwen2.5-0.5B (since removed), the image was ready in ~12 s, used 2.4 GB,
+decoded ~4 tok/s, and `docker stop` drained an in-flight stream before exiting. See
+[`docs/design.md`](docs/design.md#9-deployment).
 
 ## Layout
 
