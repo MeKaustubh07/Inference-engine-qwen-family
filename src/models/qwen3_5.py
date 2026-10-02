@@ -220,6 +220,17 @@ class Qwen35Model:
         h = self.b.rms_norm(h[last], self._vec("norm.weight", one_plus=True), self.config.rms_norm_eps)
         return self.b.linear(h, self._w("embed_tokens.weight"))
 
+    def packed_hidden(self, chunks: list[tuple[torch.Tensor, HybridState]]) -> torch.Tensor:
+        """Like forward_packed, but -> the final-norm hidden state of EVERY token [N, hidden], rows in chunk order:
+        row j of a chunk is the state after its token j (what predicts token j + 1). head() turns rows into logits."""
+        ids, positions, segs = pack(chunks, self.b.device)
+        h = self._layers(ids, positions, segs)
+        return self.b.rms_norm(h, self._vec("norm.weight", one_plus=True), self.config.rms_norm_eps)
+
+    def head(self, h: torch.Tensor) -> torch.Tensor:
+        """Final-norm hidden states [N, hidden] -> logits [N, vocab] (the tied output head)."""
+        return self.b.linear(h, self._w("embed_tokens.weight"))
+
     def decode_batch(self, tokens: list[int], states: list) -> torch.Tensor:
         """One decode step for B independent sequences -> logits [B, vocab].
 

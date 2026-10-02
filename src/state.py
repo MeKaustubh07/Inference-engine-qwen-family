@@ -39,6 +39,15 @@ class ContiguousKVCache:
     def bytes_used(self) -> int:
         return 2 * self.k[:, : self.length].numel() * self.k.element_size()
 
+    def fork(self) -> "ContiguousKVCache":
+        """An independent copy holding the same positions 0 .. length-1 (same capacity)."""
+        n_layers, max_len, h, d = self.k.shape
+        other = ContiguousKVCache(n_layers, h, d, max_len, device=self.k.device, dtype=self.k.dtype)
+        other.k[:, : self.length] = self.k[:, : self.length]
+        other.v[:, : self.length] = self.v[:, : self.length]
+        other.length = self.length
+        return other
+
 
 class OutOfBlocks(RuntimeError):
     """The shared pool has no free block left (the scheduler should queue or evict)."""
@@ -197,6 +206,17 @@ class HybridState:
     def bytes_used(self) -> int:
         fixed = (self.S.numel() + self.conv_tail.numel()) * 4
         return self.kv.bytes_used() + fixed
+
+    def fork(self) -> "HybridState":
+        """An independent copy of this sequence so far: its KV positions, recurrent state and conv tail. What is
+        fed to the copy never reaches the original or other copies (a recurrence has no attention mask: keeping
+        continuations apart means giving each its own state). Standalone states only."""
+        if self.pool is not None or not isinstance(self.kv, ContiguousKVCache):
+            raise ValueError("fork() needs a standalone state with a contiguous KV cache")
+        other = HybridState.__new__(HybridState)
+        other.kv, other.pool, other.seq = self.kv.fork(), None, None
+        other.S, other.conv_tail = self.S.clone(), self.conv_tail.clone()
+        return other
 
 
 class HybridPool:

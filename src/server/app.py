@@ -1,7 +1,8 @@
 """OpenAI-compatible HTTP API over the engine: completions and chat completions, streaming via SSE.
 
-Endpoints: POST /v1/completions, POST /v1/chat/completions, GET /health (process alive), GET /ready (model loaded
-and queue has room: load balancers should route here), GET /metrics (Prometheus text format).
+Endpoints: POST /v1/completions, POST /v1/chat/completions, POST /v1/decide (order-invariant choice / boolean /
+score decisions, src/decision.py), GET /health (process alive), GET /ready (model loaded and queue has room: load
+balancers should route here), GET /metrics (Prometheus text format).
 """
 import asyncio
 import contextlib
@@ -16,6 +17,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
+import decision
 from chat import format_chat
 from sampler import SamplingParams
 from server.metrics import Metrics
@@ -23,6 +25,7 @@ from server.scheduler import QueueFull, Scheduler
 
 log = logging.getLogger("engine.server")
 MAX_PROMPT_CHARS = 65536                  # bounds tokenization work per request before the token-length check
+MAX_OPTIONS, MAX_OPTION_CHARS, MAX_OPTION_TOKENS = 16, 1000, 64     # /v1/decide: bounds the forked states' memory
 DISCONNECT_POLL_S = 1.0                   # how often a waiting handler checks whether its client is still there
 
 
@@ -53,6 +56,16 @@ class CompletionBody(Sampling):
 class ChatMessage(BaseModel):
     role: str = Field(pattern="^(system|user|assistant)$")
     content: str = Field(max_length=MAX_PROMPT_CHARS)
+
+
+class DecideBody(BaseModel):
+    type: str = Field(pattern="^(choice|boolean|score)$")
+    question: str = Field(min_length=1, max_length=MAX_PROMPT_CHARS)
+    context: str = Field("", max_length=MAX_PROMPT_CHARS)
+    options: list[str] | None = Field(None, min_length=2, max_length=MAX_OPTIONS)
+    chat: bool = True                      # the context as a chat user turn; options are the assistant's answer
+    length_normalize: bool = True          # compare options by log-probability per token (they differ in length)
+    embeddings: bool = False               # also return each option's final hidden state
 
 
 class ChatBody(Sampling):
@@ -283,6 +296,42 @@ def create_app(engine, max_batch: int = 8, max_waiting: int = 64, kv_blocks: int
         req, n = await submit(prompt, body, 256)
         out = respond(req, n, True, body, http, body.enable_thinking)
         return out if body.stream else await out
+
+    @app.post("/v1/decide")
+    async def decide(body: DecideBody, http: HTTPRequest):
+        if len(body.context) + len(body.question) > MAX_PROMPT_CHARS:
+            raise HTTPException(400, f"context + question exceed {MAX_PROMPT_CHARS} characters")
+        if body.options and any(len(o) > MAX_OPTION_CHARS for o in body.options):
+            raise HTTPException(400, f"an option exceeds {MAX_OPTION_CHARS} characters")
+        try:                                              # tokenizing is CPU work: off the event loop and the engine
+            options, ctx, opt_ids = await asyncio.to_thread(decision.prepare, engine, body.type, body.context,
+                                                            body.question, body.options, body.chat)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        if max(map(len, opt_ids)) > MAX_OPTION_TOKENS:
+            raise HTTPException(400, f"an option exceeds {MAX_OPTION_TOKENS} tokens")
+        if len(ctx) + max(map(len, opt_ids)) > max_model_len:
+            raise HTTPException(400, f"prompt ({len(ctx)} tokens) + longest option exceeds {max_model_len}")
+        try:                                              # stepwise on the engine thread: decode keeps going
+            fut = sched.run_job(lambda: decision.score_steps(engine, body.type, options, ctx, opt_ids,
+                                                             body.length_normalize, body.embeddings,
+                                                             sched.prefill_chunk))
+        except QueueFull:
+            raise HTTPException(429, "server is at capacity; retry with backoff", headers={"Retry-After": "1"})
+        waiter = asyncio.wrap_future(fut)
+        try:
+            while True:
+                try:
+                    result = await asyncio.wait_for(asyncio.shield(waiter), DISCONNECT_POLL_S)
+                    break
+                except asyncio.TimeoutError:
+                    if await http.is_disconnected():      # nobody to answer: the engine drops the job
+                        raise HTTPException(499, "client closed request")
+        finally:
+            if not fut.done():
+                fut.cancel()
+        metrics.inc("decisions_total")
+        return {"id": f"dec-{uuid.uuid4().hex[:12]}", "object": "decision", "model": engine.name, **result}
 
     @app.get("/health")
     def health():

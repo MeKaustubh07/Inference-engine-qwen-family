@@ -1,15 +1,16 @@
-run_tests.py --save docs/bench/raw/tests at 2026-09-30 23:54 on commit 4f9581b (+ uncommitted changes, if any)
+run_tests.py --save docs/bench/raw/tests at 2026-10-02 14:24 on commit 0bd0737 (+ uncommitted changes, if any)
 
 ok   test_tokenizer     1 pass  0 fail     0.3s
-ok   test_sampling     20 pass  0 fail    13.4s
-ok   test_cache        20 pass  0 fail    76.5s
-ok   test_paged        14 pass  0 fail    29.2s
-ok   test_kernels      32 pass  0 fail     9.0s
-ok   test_native        4 pass  0 fail     2.5s
-ok   test_quant        25 pass  0 fail    64.3s
-ok   test_qwen35       42 pass  0 fail    34.0s
-ok   test_qwen35_2b     6 pass  0 fail    52.3s
-ok   test_server       45 pass  0 fail    97.2s
-ok   test_prefill      14 pass  0 fail    61.4s
+ok   test_sampling     20 pass  0 fail    10.4s
+ok   test_cache        20 pass  0 fail    48.9s
+ok   test_paged        14 pass  0 fail    18.7s
+ok   test_kernels      32 pass  0 fail     8.0s
+ok   test_native        4 pass  0 fail     2.2s
+ok   test_quant        25 pass  0 fail    49.8s
+ok   test_qwen35       42 pass  0 fail    35.1s
+ok   test_qwen35_2b     6 pass  0 fail    61.0s
+ok   test_server       45 pass  0 fail   111.8s
+ok   test_prefill      14 pass  0 fail    62.2s
+ok   test_decision     24 pass  0 fail    40.4s
 
-ALL PASSED  (440 s in all)
+ALL PASSED  (449 s in all)

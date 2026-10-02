@@ -174,6 +174,25 @@ else goes. `4f9581b` is the last commit with Qwen2.5-0.5B.
 | cache on bf16 backends (budget: 1.5 × the backend's max logit error vs HF fp32) | MPS bf16 cached vs uncached 0.19 within 0.29, argmax equal at all 8 non-tied positions of 10, greedy 10/10; Metal 0.00 within 0.00 at 10 and 57 tokens (`raw/tests/test_cache.txt`) |
 | Dockerfile default | `qwen3.5-0.8b` on the CPU (was `qwen2.5-0.5b`); needs a VM of ≥ 6 GB, not yet measured |
 
+## Order-invariant decisions (2026-10-02; `docs/bench/decision.md`)
+
+Inspired by a livestream that made Qwen3 choice-order invariant with a custom attention mask and position ids (JEV
+decision networks). On the hybrid model the recurrent layers have no mask, so each option gets a fork of the context's
+state instead.
+
+| step | result |
+|---|---|
+| `fork()` (KV + DeltaNet state + conv tail) | a fork continues exactly like the original; feeding it leaves the original untouched (0.0) |
+| forked scores vs each option alone | 5.3e-5 (CPU fp32), 5.7e-6 (Metal INT4) |
+| shuffled options | scores and embeddings bit-identical on CPU; on Metal not at first (the batched kernels group rows, so a row's rounding depends on where it lands) → options packed in a canonical order: bit-identical on Metal too |
+| first dataset run (probabilities normalized in the caller's order) | 36/40 shuffled questions identical → normalize over the sorted scores: 40/40 |
+| review (41 agents): options scored as prefixes ("1" credited with "10") | fixed first with an end-of-turn token: it measured terseness (Lyon "is" the capital, P(yes) 0.57) → replaced with a word-boundary term: "7 + 3" picks "10" (P 0.981 vs 0.003) |
+| review: unchunked context prefill, all queued decisions run back to back, abandoned decisions still run, failed jobs kept tensors alive, jobs invisible to `/ready` | chunked prefill; stepwise jobs between decode steps; cancel on disconnect; tracebacks cleared; jobs counted |
+| zero-shot accuracy, Qwen3.5-2B INT4, 300 questions of `avbiswas/bev-decision` | choice 44.0% (random 24.1%, first option 29.0%); boolean 73.0% (majority 70.0%); score 33.0% exact, 68.0% within one (`raw/decision_eval_2026-10-02.md`) |
+| cost vs re-reading the context per option | 2.7-3.7× with 4 options, 6.4-14.0× with 16 (89-1,279-token contexts) (`raw/decision_cost_2026-10-02.md`) |
+| discarded | a first cost run with an unchunked baseline (44.7× / 191.9× at 1,279 tokens): ~45 s per forward that did not reproduce (3.02 s unchunked, 3.09 s chunked) |
+| tests | `test_decision` 24 checks |
+
 ## Review workflows run
 
 | week | agents | findings → confirmed | notable |
@@ -194,3 +213,4 @@ else goes. `4f9581b` is the last commit with Qwen2.5-0.5B.
 | server gap documentation numbers, rounds 3–4 | 52 | 20 → 16 confirmed, then 4 → 3 confirmed; all fixed (after `0ee0f08`) | the gap split mixed two runs (now ~3/4 prefill within one run); the 2026-09-28 run was slow only at 4–8 clients; a prefill total included loadgen's warm-up prompts |
 | deployment fixes (lock, gauges, log reasons) | 31 | 14 → 2 confirmed (the same defect), fixed | the log fix wrote `cancelled` for stop-string completions |
 | removing Qwen2.5 (plan, port, review) | 19 | plan: 5 readers + 1 merge; review: 5 → 2 confirmed, fixed | a pointer to a moved test output; timings cited from an unarchived run (→ `run_tests.py --save`) |
+| decision endpoint | 41 | 19 → 9 confirmed + 1 split, fixed | prefix scoring, unchunked prefill, jobs blocking decode, abandoned jobs |

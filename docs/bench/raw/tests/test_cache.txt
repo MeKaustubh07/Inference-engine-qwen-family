@@ -5,7 +5,7 @@ PASS  prompt 3 (10 tokens, prefill 5): cached vs uncached logits max|diff|=4.0e-
 PASS  prompt 4 (14 tokens, prefill 7): cached vs uncached logits max|diff|=5.3e-05, same argmax everywhere
 PASS  prompt 5 (57 tokens, prefill 28): cached vs uncached logits max|diff|=4.0e-05, same argmax everywhere
 PASS  chunked prefill on a non-empty state (3 + 4 + 1...) matches uncached: max|diff|=4.7e-05
-      CPU fp32, 32 tokens: no cache 14.44s (2.2 tok/s)  |  cache 2.72s (11.7 tok/s)  -> 5.3x
+      CPU fp32, 32 tokens: no cache 10.19s (3.1 tok/s)  |  cache 2.75s (11.6 tok/s)  -> 3.7x
 PASS  cached and uncached produce the same 32 tokens
 PASS  cache is faster
 PASS  state bytes = 20324352 for 5 tokens: KV 24576 B/token in fp32 (12288 in bf16) + fixed DeltaNet 20201472

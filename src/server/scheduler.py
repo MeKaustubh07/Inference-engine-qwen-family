@@ -14,6 +14,8 @@ If the KV pool runs dry mid-generation, the newest running request is preempted:
 re-queued to recompute its prefix later (vLLM-style recompute preemption); its client sees no gap in the text.
 """
 import collections
+import concurrent.futures
+import inspect
 import itertools
 import queue
 import threading
@@ -53,6 +55,14 @@ class Request:
     finish_reason: str | None = None
 
 
+def _settle(fut: concurrent.futures.Future, result=None, error: Exception | None = None) -> None:
+    """Complete a job's future unless the requester already cancelled it (it may do so at any moment)."""
+    try:
+        fut.set_exception(error) if error is not None else fut.set_result(result)
+    except concurrent.futures.InvalidStateError:
+        pass
+
+
 class Scheduler:
     def __init__(self, engine, metrics, max_batch: int = 8, max_waiting: int = 64, kv_blocks: int = 1024,
                  block_size: int = 16, max_model_len: int = 4096, prefill_chunk: int = 512,
@@ -77,6 +87,8 @@ class Scheduler:
         self.cond = threading.Condition()
         self.accepting = True
         self._stop = False
+        self.jobs: collections.deque = collections.deque()   # (fn, future): whole-model work, e.g. a decision
+        self.job = None                                       # the job in progress: (generator, future)
         self._ids = itertools.count()
         self._arrivals = 0                                    # submitted so far: the batching window counts these
         self._warmup()                                        # every layer has run: the weight cache is complete
@@ -117,7 +129,7 @@ class Scheduler:
         if params.seed is not None:
             req.generator = torch.Generator().manual_seed(params.seed)
         with self.cond:
-            if not self.accepting or len(self.waiting) >= self.max_waiting:
+            if not self.accepting or len(self.waiting) + len(self.jobs) >= self.max_waiting:
                 self.metrics.inc("requests_rejected_total")
                 raise QueueFull("server busy")
             self.waiting.append(req)
@@ -139,8 +151,22 @@ class Scheduler:
         if queued:
             self._finish(req, "cancelled")
 
+    def run_job(self, fn) -> concurrent.futures.Future:
+        """Any thread: run fn() on the engine thread (the GPU's only user); the future gets its result or exception.
+        If fn returns a generator, the engine advances it one step per loop iteration (the return value is the
+        result), so decode steps for running streams keep going in between. Jobs run one at a time, in order; one
+        whose future is cancelled before or during its run is dropped. Shares the waiting queue's capacity."""
+        fut = concurrent.futures.Future()
+        with self.cond:
+            if not self.accepting or len(self.waiting) + len(self.jobs) >= self.max_waiting:
+                self.metrics.inc("jobs_rejected_total")
+                raise QueueFull("server busy")
+            self.jobs.append((fn, fut))
+            self.cond.notify()
+        return fut
+
     def ready(self) -> bool:
-        return self.accepting and self.thread.is_alive() and len(self.waiting) < self.max_waiting
+        return self.accepting and self.thread.is_alive() and len(self.waiting) + len(self.jobs) < self.max_waiting
 
     def shutdown(self, drain_timeout: float = 30.0) -> None:
         """Graceful: stop accepting, let running/waiting requests finish (up to the timeout), then stop the loop."""
@@ -156,18 +182,28 @@ class Scheduler:
         self.thread.join(timeout=30)                          # the loop exits after its current step
         for r in list(self.active):                           # drain timed out: tell the stragglers
             self._finish(r, "error", "server shutting down")
+        pending = [self.job[1]] if self.job else []
+        self.job = None
+        while self.jobs:
+            pending.append(self.jobs.popleft()[1])
+        for fut in pending:
+            _settle(fut, error=RuntimeError("server shutting down"))
 
     # ------------------------------------------------------------------ engine thread
     def _loop(self) -> None:
         while True:
             with self.cond:
                 idle = not self.prefilling and not self.running
-                while not self._stop and not self.waiting and not self.prefilling and not self.running:
+                while not (self._stop or self.waiting or self.prefilling or self.running or self.jobs or self.job):
                     self.cond.wait()
                 if self._stop:
                     return
-                if idle and self.batch_wait:
+                if self.job is None and self.jobs:
+                    self.job = self.jobs.popleft()
+                if idle and self.batch_wait and self.waiting:
                     self._gather()
+            if self.job is not None:
+                self._job_step()
             try:
                 self._admit()
                 if self.prefilling:
@@ -373,8 +409,34 @@ class Scheduler:
         with self.cond:
             self._update_gauges()
 
+    def _job_step(self) -> None:
+        """Advance the job in progress by one step (a plain function runs whole). A cancelled job is dropped; a
+        failed one fails alone, its traceback cleared so the frames' tensors are freed now, not by the next job."""
+        fn, fut = self.job
+        try:
+            if fut.cancelled():
+                self.job = None
+                return
+            if not inspect.isgenerator(fn):
+                fn = fn()
+                if not inspect.isgenerator(fn):
+                    self.job = None
+                    _settle(fut, result=fn)
+                    return
+                self.job = (fn, fut)
+            next(fn)
+        except StopIteration as done:
+            self.job = None
+            _settle(fut, result=done.value)
+        except Exception as e:                                # the job fails, not the server
+            self.job = None
+            _settle(fut, error=e.with_traceback(None))
+        finally:
+            fn = fut = None
+
     def _update_gauges(self) -> None:
         self.metrics.set("running_requests", len(self.running))
         self.metrics.set("prefilling_requests", len(self.prefilling))
         self.metrics.set("waiting_requests", len(self.waiting))
+        self.metrics.set("waiting_jobs", len(self.jobs) + (self.job is not None))
         self.metrics.set("kv_blocks_free", self.pool.allocator.num_free)

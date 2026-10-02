@@ -7,26 +7,26 @@ PASS  rms_norm (fp32 weights) x[7, 2, 256] max|diff|=7.2e-07
 PASS  rms_norm (bf16 weights) T=7 max|diff|=6.0e-08
 PASS  rope H=10 positions up to 4: relative max|diff|=4.5e-08
 PASS  rope H=10 positions up to 31999: relative max|diff|=7.8e-08
-PASS  matvec 5120x1024: rel diff 1.5e-07 | cold weights: ours 149 us (70 GB/s) vs torch 180 us
-PASS  matvec 1024x2048: rel diff 2.1e-07 | cold weights: ours 69 us (60 GB/s) vs torch 69 us
-PASS  matvec 8224x1024: rel diff 1.6e-07 | cold weights: ours 248 us (68 GB/s) vs torch 243 us
-PASS  matvec 7168x1024: rel diff 1.5e-07 | cold weights: ours 220 us (67 GB/s) vs torch 218 us
-PASS  matvec 1024x3584: rel diff 2.3e-07 | cold weights: ours 104 us (71 GB/s) vs torch 112 us
-PASS  matvec 248320x1024: rel diff 1.9e-07 | cold weights: ours 5763 us (88 GB/s) vs torch 5577 us
-PASS  matvec 896x896 +bias: rel diff 1.4e-07 | cold weights: ours 31 us (53 GB/s) vs torch 41 us
-PASS  gemm T=7 5120x1024: rel diff 1.1e-06 | tiled 615 us (0.12 TFLOP/s) vs torch 182 us
-PASS  gemm T=64 7168x1024: rel diff 0.0e+00 | tiled 3268 us (0.29 TFLOP/s) vs torch 809 us
-PASS  gemm T=256 1024x3584: rel diff 0.0e+00 | tiled 6521 us (0.29 TFLOP/s) vs torch 1535 us
-PASS  gemm T=1024 8224x1024: rel diff 0.0e+00 | tiled 60461 us (0.29 TFLOP/s) vs torch 13138 us
+PASS  matvec 5120x1024: rel diff 1.5e-07 | cold weights: ours 154 us (68 GB/s) vs torch 180 us
+PASS  matvec 1024x2048: rel diff 2.1e-07 | cold weights: ours 72 us (58 GB/s) vs torch 88 us
+PASS  matvec 8224x1024: rel diff 1.6e-07 | cold weights: ours 249 us (68 GB/s) vs torch 291 us
+PASS  matvec 7168x1024: rel diff 1.5e-07 | cold weights: ours 199 us (74 GB/s) vs torch 214 us
+PASS  matvec 1024x3584: rel diff 2.3e-07 | cold weights: ours 110 us (67 GB/s) vs torch 114 us
+PASS  matvec 248320x1024: rel diff 1.9e-07 | cold weights: ours 5450 us (93 GB/s) vs torch 5336 us
+PASS  matvec 896x896 +bias: rel diff 1.4e-07 | cold weights: ours 28 us (57 GB/s) vs torch 41 us
+PASS  gemm T=7 5120x1024: rel diff 1.1e-06 | tiled 595 us (0.12 TFLOP/s) vs torch 174 us
+PASS  gemm T=64 7168x1024: rel diff 0.0e+00 | tiled 3226 us (0.29 TFLOP/s) vs torch 799 us
+PASS  gemm T=256 1024x3584: rel diff 0.0e+00 | tiled 6434 us (0.29 TFLOP/s) vs torch 1522 us
+PASS  gemm T=1024 8224x1024: rel diff 0.0e+00 | tiled 58853 us (0.29 TFLOP/s) vs torch 12933 us
 PASS  matvec + fused residual: rel diff 1.8e-07
-PASS  fused swiglu: rel diff 2.3e-07 | fused 169 us vs 3 separate kernels 183 us
-PASS  attention_decode S=1 q-scale 1 d=256: max|diff|=0.0e+00 | ours 16 us vs torch ops 86 us
-PASS  attention_decode S=5 q-scale 1 d=256: max|diff|=3.3e-07 | ours 16 us vs torch ops 92 us
-PASS  attention_decode S=300 q-scale 1 d=256: max|diff|=2.1e-07 | ours 78 us vs torch ops 238 us
-PASS  attention_decode S=2048 q-scale 1 d=256: max|diff|=1.9e-07 | ours 689 us vs torch ops 1140 us
-PASS  attention_decode S=300 q-scale 30 d=256: max|diff|=2.0e-05 | ours 88 us vs torch ops 295 us
-PASS  attention_decode S=2048 q-scale 30 d=256: max|diff|=1.2e-05 | ours 722 us vs torch ops 1179 us
-PASS  attention_decode S=300 q-scale 30 d=64: max|diff|=5.3e-06 | ours 44 us vs torch ops 249 us
+PASS  fused swiglu: rel diff 2.3e-07 | fused 162 us vs 3 separate kernels 177 us
+PASS  attention_decode S=1 q-scale 1 d=256: max|diff|=0.0e+00 | ours 16 us vs torch ops 85 us
+PASS  attention_decode S=5 q-scale 1 d=256: max|diff|=3.3e-07 | ours 17 us vs torch ops 91 us
+PASS  attention_decode S=300 q-scale 1 d=256: max|diff|=2.1e-07 | ours 78 us vs torch ops 220 us
+PASS  attention_decode S=2048 q-scale 1 d=256: max|diff|=1.9e-07 | ours 623 us vs torch ops 1106 us
+PASS  attention_decode S=300 q-scale 30 d=256: max|diff|=2.0e-05 | ours 79 us vs torch ops 224 us
+PASS  attention_decode S=2048 q-scale 30 d=256: max|diff|=1.2e-05 | ours 619 us vs torch ops 1107 us
+PASS  attention_decode S=300 q-scale 30 d=64: max|diff|=5.3e-06 | ours 34 us vs torch ops 129 us
 PASS  paged_attention_decode B=5 lengths [1, 7, 16, 33, 300], block size 16, scrambled tables, 8/2 heads d=256: max|diff|=6.0e-07
 PASS  paged_attention_decode B=5 lengths [1, 7, 16, 33, 300], block size 16, scrambled tables, 14/2 heads d=64: max|diff|=3.6e-07
 PASS  lock_in_memory: 256 MiB locked for 4 x 64 MiB MPS tensors (+ a view of one); user wire count of their memory [0, 0, 0, 0] -> [1, 1, 1, 1] -> [0, 0, 0, 0] after unlock; GPU results unchanged

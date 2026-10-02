@@ -40,7 +40,7 @@ load test). Details and methodology: [`docs/bench/compare.md`](docs/bench/compar
 | state | paged KV cache (block allocator, block tables) + fixed-size DeltaNet recurrent/conv state per sequence |
 | kernels (MSL) | bf16/INT8/INT4 matvec (+ batched), paged attention, batched DeltaNet step, RMSNorm, RoPE, fused SwiGLU, INT4/INT8 → fp32 expansion |
 | quantization | block-32 INT8, asymmetric INT4 with a calibrated per-tensor mixed-precision policy; `.qt` mmap format |
-| serving | continuous batching, packed + chunked prefill, batched sampling, recompute preemption, 429 backpressure, SSE streaming, cancellation, graceful drain |
+| serving | continuous batching, packed + chunked prefill, batched sampling, recompute preemption, 429 backpressure, SSE streaming, cancellation, graceful drain; an order-invariant decision endpoint (choice / boolean / score) |
 | operations | `/health`, `/ready`, Prometheus `/metrics` (TTFT/TPOT/e2e histograms), JSON request logs, weights locked in RAM (so macOS cannot page out an idle server's weights), Dockerfile |
 
 ## Quick start
@@ -75,6 +75,15 @@ curl -N http://127.0.0.1:8000/v1/chat/completions -H 'content-type: application/
 
 Any OpenAI client works with `base_url="http://127.0.0.1:8000/v1"`.
 
+Decisions: each option is scored as a continuation of the context from its own copy of the context's state, so the
+answer cannot depend on the order the options are listed in (`docs/design.md`, `docs/bench/decision.md`):
+
+```bash
+curl http://127.0.0.1:8000/v1/decide -H 'content-type: application/json' -d '{"type":"choice","question":"What is the capital of France?","options":["Lyon","Paris","Nice"]}'
+```
+
+`type` is `choice` (pick one), `boolean` (yes / no; no options needed) or `score` (ordinal labels, lowest first).
+
 ## Tests
 
 The suites need more than the Quick start: the Qwen3.5-0.8B checkpoint, the 2B INT8 file, the native runtime and
@@ -98,13 +107,14 @@ Then:
 scripts/.venv/bin/python scripts/run_tests.py
 ```
 
-`--quick` skips the cache, quantization, Qwen3.5, serving and prefill suites (it runs tokenizer, sampling, paged,
-kernels and native). The 11 suites cover the tokenizer, sampling (incl. batched == per-request), the hybrid cache
+`--quick` skips the cache, quantization, Qwen3.5, serving, prefill and decision suites (it runs tokenizer, sampling,
+paged, kernels and native). The 12 suites cover the tokenizer, sampling (incl. batched == per-request), the hybrid cache
 (cached == uncached, KV and DeltaNet byte accounting, MPS fp32/bf16 and Metal), paged state (isolation, running out
 of blocks or state slots), kernels, native runtime, quantization, Qwen3.5-0.8B vs HF fp32 (every layer),
 Qwen3.5-2B (bf16/INT8/INT4), the server (batched == sequential, preemption, streaming, 429, cancellation, drain)
-and packed/chunked prefill (packed == alone, chunked == sequential, batching window). `--save docs/bench/raw/tests`
-archives each suite's output and a summary with timings: the last full run (223 checks, 440 s) is in
+packed/chunked prefill (packed == alone, chunked == sequential, batching window) and decisions (forked == alone,
+shuffled options give bit-identical scores, stepwise jobs between decode steps). `--save docs/bench/raw/tests`
+archives each suite's output and a summary with timings: the last full run (247 checks, 449 s) is in
 [`docs/bench/raw/tests/`](docs/bench/raw/tests/); the last run with Qwen2.5 is in
 [`docs/bench/raw/tests/2026-09-30-with-qwen2.5/`](docs/bench/raw/tests/2026-09-30-with-qwen2.5/).
 

@@ -93,6 +93,29 @@ prompt + generated tokens through the same packed, chunked prefill (vLLM-style r
 pause, not a gap: the output is identical to an uninterrupted run (`tests/test_server.py` checks this with greedy
 decoding; `tests/test_prefill.py` with 4-token prefill chunks on Qwen3.5-0.8B INT4, the hybrid model).
 
+**Decisions (`POST /v1/decide`, `src/decision.py`).** A context, a question and N options in; the probability of
+each option and a decision out, for three question types: choice (pick one), boolean (yes / no), score (an ordinal
+label). Listing the options in the prompt would give each a different position and let later options see earlier
+ones, so the answer could depend on their order. Instead:
+1. The context is prefilled once, in `prefill_chunk` pieces.
+2. Each option continues from its own **fork** of the context's state (`HybridState.fork`): a copy of the
+   attention layers' K/V and of the DeltaNet recurrent state and conv tail. Attention could hide options from each
+   other with a mask, but a recurrence has no mask: its state summarizes everything it has read, so isolating the
+   options means giving each its own copy. Every fork has the context's length, so every option starts at the same
+   position.
+3. All options run as segments of one packed forward pass (`packed_hidden`), in a canonical order (sorted by token
+   ids), so any permutation of the options produces the identical batch and identical scores, bit for bit. (The
+   batched kernels group rows, so a row's rounding can depend on where it lands in the batch.)
+4. An option scores as a whole word: log P(its tokens) + log P(the next token cannot continue its last word or
+   number). So "1" is not credited with "10", and "No" is not penalized because the model would go on "No, the
+   capital is ...". Probabilities are a softmax over the options' per-token scores, normalized in sorted order so
+   they too are identical under any permutation.
+The work runs on the engine thread as a stepwise job (`Scheduler.run_job`): one context chunk or option group per
+loop iteration, with decode steps for running streams in between; a client that disconnects cancels it. Forks are
+standalone states outside the KV pool, run in groups that keep them under 256 MB. The JEV-style "answer token that
+sees every option" has no order-invariant equivalent in the DeltaNet layers (a recurrence reads the options in
+some order), so options are scored independently.
+
 ## 4. Memory budget (Qwen3.5-2B, INT4, 8 GB machine)
 
 | item | size | how |
@@ -177,7 +200,7 @@ the same route above 32 rows, so a prompt packed with others keeps fp32 activati
 - **Invariants**: cached == uncached; paged == contiguous; batched == sequential (greedy tokens identical, logits
   within 6e-5 in fp32 on the CPU; bit-identical in bf16 on Metal); preempted == uninterrupted; fused kernels ==
   reference ops; batched kernels == per-row kernels.
-- `scripts/run_tests.py` runs all 11 suites and exits nonzero on any failure.
+- `scripts/run_tests.py` runs all 12 suites and exits nonzero on any failure.
 
 ## 8. Operations
 
@@ -187,7 +210,7 @@ the same route above 32 rows, so a prompt packed with others keeps fp32 activati
 | overload | bounded queue → 429 + Retry-After; admission by KV blocks; preemption instead of OOM |
 | slow or gone clients | a disconnect (streaming, or non-streaming, polled every second) cancels the request at the next step and frees its blocks |
 | shutdown | SIGTERM → uvicorn stops accepting and lets open requests finish (up to `--drain-timeout`, 25 s) → the lifespan stops the scheduler (anything left has no client, 2 s) → exit; run containers with a longer stop timeout (`docker run --stop-timeout 30`) |
-| metrics | Prometheus: request/token counters, prefill passes and tokens, running/prefilling/waiting/KV-free gauges (read at scrape time, so a request queued behind a step in progress shows), weights locked in RAM, TTFT/TPOT/e2e histograms |
+| metrics | Prometheus: request/token counters, decisions answered and decision jobs turned away, prefill passes and tokens, running/prefilling/waiting/waiting-job/KV-free gauges (read at scrape time, so a request queued behind a step in progress shows), weights locked in RAM, TTFT/TPOT/e2e histograms |
 | logs | one JSON line per finished request (id, tokens, finish reason as the client was told it, `cancelled` for a client that left, TTFT, latency) |
 | memory residency | after the warm-up the weights are `mlock`ed, so an idle server's next request does not wait for macOS to page them back in (measured 0.25 s warm vs up to 0.81 s after 4 min idle; `--no-lock-weights` turns it off) |
 | failure isolation | a failed packed prefill pass fails the requests in that pass; a request that cannot be sampled fails alone; a failed decode step fails every request in flight (running and still prefilling), not the server |
@@ -257,6 +280,9 @@ The engine is **stateful**: a sequence's KV blocks and DeltaNet state live in on
 - **After idle and on first use**: the KV cache and DeltaNet state pools (~0.5 GB) are not locked, so an idle server
   can still lose up to ~0.2 s on its next first token, and the first request of each new prompt length pays
   ~0.1–0.2 s of MPS shape compilation. Locking the pools and warming common prompt lengths at start-up fix both.
+- **Decisions copy the context per option**: each fork holds its own copy of the context's K/V (and the ~19 MB
+  DeltaNet state), so time and memory grow with context length × options (grouped under 256 MB). Sharing the
+  context's KV blocks copy-on-write, the basis of prefix caching, would remove the copy.
 - Batch 2 barely beats batch 1: the linears cost 33 vs 17 ms, and the 2-rows kernel is 1.2–2.1× slower than the
   single-row kernel at one row (which is why M = 1 keeps its own kernel).
   Simdgroup-matrix (8×8 hardware tile) kernels, as in MLX and llama.cpp's `mul_mm`, are the next step for both
